@@ -8,7 +8,7 @@
 
 ### Changed
 
-- `readDamagedSqliteRows()` now explores the intervals its probes skip and tries an exact `rowid =` seek at every probe, so it recovers rows on live pages between damaged ones — including a row whose predecessor sits on a damaged page — instead of only the first row past the damage.
+- `readDamagedSqliteRows()` recovers more readable rows around damaged pages and no longer hangs when salvage reaches a readable page beyond the current search interval ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.10.0] - 2026-10-12
 

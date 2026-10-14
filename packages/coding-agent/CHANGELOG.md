@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed a crash (`i.replace is not a function`) on history recall when `history.db` holds corrupted rows whose `prompt` is not text; the store now quarantines and salvages the damaged database on open and history reads skip malformed rows.
+- Fixed pressing Up in the composer crashing omp with `TypeError: text.replace is not a function` when `history.db` was damaged; a damaged prompt-history store is now set aside on the next start and its readable prompts, session titles, and recaps are carried over, so history recall, search, and saving prompts work again ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.11.0] - 2026-10-14
 
@@ -36,7 +36,6 @@
 - Fixed a tab that a relay page opens over its own CDP session (`Target.createTarget`) landing in a separate Chrome window with `newWindow`, under an id omp could not attach to, activate or close; it now opens as a relay tab in that page's browser ([#15494](https://github.com/can1357/oh-my-pi/pull/15494) by [@alnaggar-dev](https://github.com/alnaggar-dev) and [@will-bogusz](https://github.com/will-bogusz))
 - Fixed an Anthropic refusal fallback redeeming its fallback credit with an outdated system prompt and tools after switching models; it now sends a fresh request ([#15702](https://github.com/can1357/oh-my-pi/pull/15702) by [@H4vC](https://github.com/H4vC))
 - Fixed OpenAI/Codex auto-compaction failing with "Remote compaction input exceeds the context window" after a turn's final response pushed history past the window; native compaction now compacts the history before the kept recent turns, which stay in context as-is ([#15712](https://github.com/can1357/oh-my-pi/pull/15712) by [@H4vC](https://github.com/H4vC))
-- Fixed pressing Up in the composer crashing omp with `TypeError: text.replace is not a function` when `history.db` was damaged; a damaged prompt-history store is now set aside on the next start and its readable prompts, session titles, and recaps are carried over, so history recall, search, and saving prompts work again ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 - Fixed `omp commit`, `/git`, and other agent commits skipping the signature when Git's `commit.gpgsign` is enabled; they now sign with the configured key, and a signing failure leaves HEAD unchanged ([#14810](https://github.com/can1357/oh-my-pi/issues/14810))
 - Fixed rejected `task` calls appearing successful to SDK hosts instead of reporting a tool error ([#15573](https://github.com/can1357/oh-my-pi/issues/15573))
 - Fixed `read` claiming regenerated images were identical when their pixels changed at the same path ([#15668](https://github.com/can1357/oh-my-pi/issues/15668))

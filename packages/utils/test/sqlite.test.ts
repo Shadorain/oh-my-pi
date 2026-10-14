@@ -355,13 +355,16 @@ test.each([
 	}
 });
 
-test("damaged-row salvage recovers rows past a damaged leftmost leaf", async () => {
+test.each([1, -2])("damaged-row salvage recovers past a leftmost leaf starting at %i", async firstId => {
 	await using dir = await TempDir.create("@omp-sqlite-salvage-leftmost-");
 	const dbPath = dir.join("store.db");
 	const total = 60;
 	const seed = new Database(dbPath);
 	seed.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)");
 	const insert = seed.prepare("INSERT INTO entries (id, value) VALUES (?, ?)");
+	if (firstId < 0) {
+		for (let id = firstId; id < 0; id++) insert.run(id, `${id}:${"x".repeat(1500)}`);
+	}
 	for (let id = 1; id <= total; id++) insert.run(id, `${id}:${"x".repeat(1500)}`);
 	const pageSize = seed.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
 	const pageCount = seed.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count;
@@ -381,7 +384,7 @@ test("damaged-row salvage recovers rows past a damaged leftmost leaf", async () 
 		let largestLive = false;
 		try {
 			try {
-				probe.query("SELECT id FROM entries WHERE rowid = 1").get();
+				probe.query("SELECT id FROM entries WHERE rowid = ?").get(firstId);
 			} catch {
 				smallestDead = true;
 			}

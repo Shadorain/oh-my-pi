@@ -456,6 +456,7 @@ export function readDamagedSqliteRows<T>(
 			if (seek === "end") break;
 			if (seek !== "damaged") {
 				keep(seek);
+				if (seek.rowid > hi) break;
 				origin = seek.rowid;
 				seek = read(nextStmt, origin);
 				continue;
@@ -465,9 +466,7 @@ export function readDamagedSqliteRows<T>(
 			let skipped = origin;
 			let resumed = false;
 			for (let step = 1; ; step *= 2) {
-				// Real rowids are positive. A damaged leftmost leaf fails every
-				// descent, so probing negative origins would never reach the
-				// live leaves — anchor at 0 and let the doubling take over.
+				// Anchor the initial negative origin near auto-assigned rowids.
 				const probe = Math.min(skipped < 0 ? Math.max(0, skipped + step) : skipped + step, hi);
 				// A row at `probe` itself can sit on a readable leaf while every
 				// `rowid >` path to it routes through damage.
@@ -475,7 +474,10 @@ export function readDamagedSqliteRows<T>(
 				keep(exact);
 				const hit = read(nextStmt, probe);
 				// A width-1 gap holds only the dead probe's own origin.
-				if (probe > skipped + 1 && (typeof exact === "object" || typeof hit === "object")) {
+				const liveInRange =
+					(typeof exact === "object" && exact.rowid > skipped && exact.rowid <= hi) ||
+					(typeof hit === "object" && hit.rowid > skipped && hit.rowid <= hi);
+				if (probe > skipped + 1 && (skipped > lo || probe < hi) && liveInRange) {
 					pending.push([skipped, probe, true]);
 				}
 				if (hit === "damaged") {
