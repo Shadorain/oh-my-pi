@@ -152,6 +152,7 @@ export class HistoryStorage {
 	#addListener?: () => void;
 	#errorListener?: (error: unknown) => void;
 	#writeFailureReported = false;
+	#repairFlagged = false;
 
 	// Prepared statements
 	#upsertRowStmt: Statement;
@@ -305,6 +306,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			this.#insertBatch([{ prompt: trimmed, cwd: cwd ?? undefined, sessionId: session || undefined }]);
 		} catch (error) {
 			logger.error("HistoryStorage add failed", { error: String(error) });
+			this.#flagForRepair(error);
 			if (!this.#writeFailureReported) {
 				this.#writeFailureReported = true;
 				this.#errorListener?.(error);
@@ -326,6 +328,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
+			this.#flagForRepair(error);
 			return [];
 		}
 	}
@@ -353,6 +356,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 		} catch (error) {
 			// Malformed FTS expression - fall through to substring path.
 			logger.debug("HistoryStorage FTS query failed, using substring only", { error: String(error) });
+			this.#flagForRepair(error);
 		}
 
 		// 2. Substring fallback (token-AND LIKE). Catches infix matches FTS5's
@@ -363,6 +367,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			subRows = this.#searchSubstring(tokens, safeLimit, filter);
 		} catch (error) {
 			logger.error("HistoryStorage substring search failed", { error: String(error) });
+			this.#flagForRepair(error);
 		}
 
 		if (ftsRows.length === 0) {
@@ -454,16 +459,42 @@ ON CONFLICT(prompt) DO UPDATE SET
 	}
 
 	/**
-	 * Inserts rows with their original ids. `OR IGNORE`: a rebuild inserts into
-	 * an empty table, but a salvage can race a peer process that already wrote
-	 * to the replacement store, and its rows win.
+	 * Inserts rows, keeping each original id unless it is taken, and merges a
+	 * prompt that already exists like {@link collapseByPrompt}. A rebuild
+	 * inserts into an empty table; a salvage can race a peer process that
+	 * already wrote to the replacement store, and neither side's prompts may be
+	 * dropped.
 	 */
 	#insertRows(rows: HistoryRow[]): void {
-		const insert = this.#db.query(
-			"INSERT OR IGNORE INTO history (id, prompt, created_at, cwd, session_id, use_count) VALUES (?, ?, ?, ?, ?, ?)",
-		);
+		const insert = this.#db.query(`
+INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count)
+VALUES (CASE WHEN EXISTS (SELECT 1 FROM history WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT(prompt) DO UPDATE SET
+	use_count = history.use_count + excluded.use_count,
+	created_at = max(history.created_at, excluded.created_at),
+	cwd = CASE WHEN excluded.created_at > history.created_at THEN excluded.cwd ELSE history.cwd END,
+	session_id = CASE WHEN excluded.created_at > history.created_at THEN excluded.session_id ELSE history.session_id END
+		`);
 		for (const row of rows) {
 			insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id, row.use_count);
+		}
+	}
+
+	/**
+	 * The open-time integrity check runs only in the data pass, so a store that
+	 * reports corruption later resets `user_version` to re-arm it: the next
+	 * open verifies the store, then quarantines and salvages it if damaged.
+	 */
+	#flagForRepair(error: unknown): void {
+		if (this.#repairFlagged || !isSqliteCorruptionError(error)) return;
+		this.#repairFlagged = true;
+		try {
+			this.#db.run("PRAGMA user_version = 0");
+			logger.warn("HistoryStorage store reported corruption; it will be verified and repaired on next start", {
+				error: String(error),
+			});
+		} catch (flagError) {
+			logger.error("HistoryStorage could not flag the store for repair", { error: String(flagError) });
 		}
 	}
 
@@ -481,7 +512,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			return;
 		}
 		try {
-			const { rows, unreadable } = readDamagedSqliteRows<HistoryRow>(
+			const { rows, damagedRegions } = readDamagedSqliteRows<HistoryRow>(
 				source,
 				"history",
 				historyRowColumns(source),
@@ -492,7 +523,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			logger.warn("HistoryStorage salvaged prompts from a corrupt store", {
 				backupPath,
 				salvaged: salvaged.length,
-				unreadable,
+				damagedRegions,
 			});
 		} catch (error) {
 			logger.error("HistoryStorage salvage failed", { backupPath, error: String(error) });

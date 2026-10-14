@@ -2,7 +2,13 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isSqliteCorruptionError, openSqliteDatabase, openSqliteDatabaseSync } from "../src/sqlite";
+import {
+	isSqliteCorruptionError,
+	onSqliteStoreQuarantine,
+	openSqliteDatabase,
+	openSqliteDatabaseSync,
+	readDamagedSqliteRows,
+} from "../src/sqlite";
 import { TempDir } from "../src/temp";
 
 async function corruptSchemaPages(dbPath: string): Promise<Buffer<ArrayBuffer>> {
@@ -265,4 +271,86 @@ test("a non-corruption init failure on a store that fails quick_check is preserv
 	const backups = (await backupNames(dir.path())).filter(name => !/-wal$|-shm$|-journal$/.test(name));
 	expect(backups).toHaveLength(1);
 	expect(await fs.promises.readFile(path.join(dir.path(), backups[0]!))).toEqual(damaged);
+});
+
+test("a long-lived connection's quarantine hook runs after the evidence is copied and before the store is removed", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-quarantine-hook-");
+	const dbPath = dir.join("store.db");
+	const damaged = await corruptSchemaPages(dbPath);
+	const observed: Array<{ storePresent: boolean; evidence: string[] }> = [];
+	const unregister = onSqliteStoreQuarantine(dbPath, () => {
+		observed.push({ storePresent: fs.existsSync(dbPath), evidence: fs.readdirSync(dir.path()) });
+	});
+	try {
+		openSqliteDatabaseSync(
+			dbPath,
+			db => {
+				db.query("SELECT count(*) FROM sqlite_master").get();
+				db.close();
+			},
+			{ recoverCorruption: true },
+		);
+	} finally {
+		unregister();
+	}
+
+	expect(observed).toHaveLength(1);
+	expect(observed[0]!.storePresent).toBe(true);
+	const backup = observed[0]!.evidence.find(name => /^store\.db\.corrupt-[^-]+-[0-9a-f-]+$/.test(name));
+	expect(backup).toBeDefined();
+	expect(await fs.promises.readFile(path.join(dir.path(), backup!))).toEqual(damaged);
+});
+
+test("damaged-row salvage terminates on a huge sparse AUTOINCREMENT high-water mark", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-salvage-sparse-");
+	const db = new Database(dir.join("store.db"));
+	try {
+		db.run("CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)");
+		db.run("INSERT INTO entries (id, value) VALUES (1, 'first'), (1099511627776, 'far')");
+		db.run("UPDATE sqlite_sequence SET seq = 4503599627370495 WHERE name = 'entries'");
+
+		expect(readDamagedSqliteRows(db, "entries", "id, value")).toEqual({
+			rows: [
+				{ id: 1, value: "first" },
+				{ id: 1099511627776, value: "far" },
+			],
+			damagedRegions: 0,
+		});
+	} finally {
+		db.close();
+	}
+});
+
+test.each([
+	{ region: "a middle leaf", page: (pages: number) => Math.floor(pages / 2), lastSurvives: true },
+	{ region: "the rightmost leaf", page: (pages: number) => pages, lastSurvives: false },
+])("damaged-row salvage reads past damage in $region", async ({ page, lastSurvives }) => {
+	await using dir = await TempDir.create("@omp-sqlite-salvage-damaged-");
+	const dbPath = dir.join("store.db");
+	const total = 40;
+	const seed = new Database(dbPath);
+	// No AUTOINCREMENT: a damaged rightmost page leaves no readable max rowid to bound the scan.
+	seed.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)");
+	const insert = seed.prepare("INSERT INTO entries (id, value) VALUES (?, ?)");
+	// ~1.5 KB rows: at most two per leaf, and appends allocate leaves in rowid order.
+	for (let id = 1; id <= total; id++) insert.run(id, `${id}:${"x".repeat(1500)}`);
+	const pageSize = seed.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const pageCount = seed.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count;
+	seed.close();
+	const fd = fs.openSync(dbPath, "r+");
+	fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (page(pageCount) - 1) * pageSize);
+	fs.closeSync(fd);
+
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		const { rows, damagedRegions } = readDamagedSqliteRows<{ id: number }>(db, "entries", "id");
+		const ids = rows.map(row => row.id);
+		expect(damagedRegions).toBe(1);
+		expect(ids[0]).toBe(1);
+		expect(ids.length).toBeGreaterThanOrEqual(total - 2);
+		expect(ids.includes(total)).toBe(lastSurvives);
+		expect(ids).toEqual([...ids].sort((a, b) => a - b));
+	} finally {
+		db.close();
+	}
 });

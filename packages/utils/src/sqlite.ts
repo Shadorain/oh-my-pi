@@ -1,5 +1,5 @@
 /** Shared SQLite opening, error attribution, and result-code classification for persistent stores. */
-import { Database } from "bun:sqlite";
+import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getDbBusyTimeoutMs } from "./env";
@@ -58,6 +58,46 @@ function closePeerCorruptHandles(dbPath: string, own: Database | undefined): voi
 				path: dbPath,
 				error: String(error),
 			});
+		}
+	}
+}
+
+/** Release callbacks of long-lived connections, keyed like {@link pendingCorruptHandles}. */
+const quarantineHooks = new Map<string, Set<() => void>>();
+
+/**
+ * Registers `release` to run in-process when the store at `dbPath` is
+ * quarantined, after its evidence is copied and before its files are
+ * unlinked. Connections opened outside {@link openSqliteDatabase} use it to
+ * close their handle: Windows refuses to unlink a held file, and elsewhere the
+ * handle would keep writing to the quarantined file. Returns an unregister
+ * function.
+ */
+export function onSqliteStoreQuarantine(dbPath: string, release: () => void): () => void {
+	const key = corruptHandleKey(dbPath);
+	let hooks = quarantineHooks.get(key);
+	if (!hooks) {
+		hooks = new Set();
+		quarantineHooks.set(key, hooks);
+	}
+	hooks.add(release);
+	return () => {
+		const current = quarantineHooks.get(key);
+		if (!current) return;
+		current.delete(release);
+		if (current.size === 0) quarantineHooks.delete(key);
+	};
+}
+
+function runQuarantineHooks(dbPath: string): void {
+	const hooks = quarantineHooks.get(corruptHandleKey(dbPath));
+	if (!hooks) return;
+	// Deleting the current element mid-iteration is safe for a Set; a release typically unregisters itself.
+	for (const release of hooks) {
+		try {
+			release();
+		} catch (error) {
+			logger.warn("Failed to release a SQLite handle before quarantine", { path: dbPath, error: String(error) });
 		}
 	}
 }
@@ -212,6 +252,7 @@ function quarantineCorruptSqliteStore(dbPath: string, db: Database | undefined):
 	// each peer must keep its own handle until it closes it after adopting the
 	// replacement; closing it here races the peer's recovery on POSIX.
 	if (process.platform === "win32") closePeerCorruptHandles(dbPath, db);
+	runQuarantineHooks(dbPath);
 
 	const removed: string[] = [];
 	try {
@@ -346,46 +387,82 @@ export function checkpointWal(db: Database): void {
 	db.run("PRAGMA wal_checkpoint(PASSIVE)");
 }
 
+type SalvageSeek = { rowid: number; ok: boolean; row: Record<string, unknown> } | "end" | "damaged";
+
 /**
- * Reads every readable row of a possibly damaged rowid table, one rowid at a
- * time: a scan aborts at the first corrupt page, while a point lookup fails only
- * for rows behind it. Rowids are bounded by the table's max rowid and its
- * `AUTOINCREMENT` high-water mark, whichever is readable and larger.
- * `predicate` filters rows (e.g. by `typeof`) before they are returned.
- * Corrupt lookups are counted as `unreadable`; any other error propagates.
+ * Reads every readable row of a possibly damaged rowid table. Rows are
+ * visited by rowid seeks (`rowid > ?`), so work grows with the rows actually
+ * stored, never with a (possibly corrupt or sparse) max rowid. When a seek
+ * lands on a damaged page, the scan finds the first seek origin past it by
+ * doubling then bisecting — at most ~2×53 seeks per damaged region — and
+ * resumes there; rows inside that region are lost. `predicate` filters rows
+ * (e.g. by `typeof`) before they are returned. Corrupt-page errors count
+ * toward `damagedRegions`; any other error propagates.
  */
 export function readDamagedSqliteRows<T>(
 	db: Database,
 	table: string,
 	columns: string,
 	predicate = "1",
-): { rows: T[]; unreadable: number } {
-	const bounds = [`SELECT max(rowid) AS id FROM ${table}`];
-	if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get()) {
-		bounds.push(`SELECT seq AS id FROM sqlite_sequence WHERE name = '${table}'`);
-	}
-	let lastRowid = 0;
-	for (const sql of bounds) {
+): { rows: T[]; damagedRegions: number } {
+	const selection = `rowid AS __salvage_rowid, (${predicate}) AS __salvage_ok, ${columns}`;
+	const nextStmt = db.query<Record<string, unknown>, [number]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT 1`,
+	);
+	const exactStmt = db.query<Record<string, unknown>, [number]>(`SELECT ${selection} FROM ${table} WHERE rowid = ?`);
+	const read = (stmt: Statement<Record<string, unknown>, [number]>, origin: number): SalvageSeek => {
+		let hit: Record<string, unknown> | null;
 		try {
-			const id = db.query<{ id: unknown }, []>(sql).get()?.id;
-			if (typeof id === "number" && Number.isSafeInteger(id)) lastRowid = Math.max(lastRowid, id);
+			hit = stmt.get(origin);
 		} catch (error) {
 			if (!isSqliteCorruptionError(error)) throw error;
+			return "damaged";
 		}
-	}
-	const probe = db.query<T, [number]>(`SELECT ${columns} FROM ${table} WHERE rowid = ? AND (${predicate})`);
+		if (!hit) return "end";
+		const { __salvage_rowid: rowid, __salvage_ok: ok, ...row } = hit;
+		if (typeof rowid !== "number" || !Number.isSafeInteger(rowid)) return "end";
+		// A cross-linked page can surface rowids out of order; treat that as damage so the scan always advances.
+		if (stmt === nextStmt && rowid <= origin) return "damaged";
+		return { rowid, ok: ok === 1, row };
+	};
+
 	const rows: T[] = [];
-	let unreadable = 0;
-	for (let rowid = 1; rowid <= lastRowid; rowid++) {
-		try {
-			const row = probe.get(rowid);
-			if (row) rows.push(row);
-		} catch (error) {
-			if (!isSqliteCorruptionError(error)) throw error;
-			unreadable++;
+	const keep = (seek: SalvageSeek): void => {
+		if (typeof seek === "object" && seek.ok) rows.push(seek.row as T);
+	};
+	let damagedRegions = 0;
+	let origin = Number.MIN_SAFE_INTEGER;
+	for (;;) {
+		const seek = read(nextStmt, origin);
+		if (seek === "end") break;
+		if (seek !== "damaged") {
+			keep(seek);
+			origin = seek.rowid;
+			continue;
 		}
+		damagedRegions++;
+		// Seeks from `bad` hit the damage; double the step until one does not, then bisect back.
+		let bad = origin;
+		let good: number;
+		for (let step = 1; ; step *= 2) {
+			const probe = Math.min(bad + step, Number.MAX_SAFE_INTEGER);
+			if (read(nextStmt, probe) !== "damaged") {
+				good = probe;
+				break;
+			}
+			if (probe === Number.MAX_SAFE_INTEGER) return { rows, damagedRegions };
+			bad = probe;
+		}
+		while (good - bad > 1) {
+			const mid: number = bad + Math.floor((good - bad) / 2);
+			if (read(nextStmt, mid) === "damaged") bad = mid;
+			else good = mid;
+		}
+		// Seeks resume after `good`, so read the row at `good` itself directly.
+		keep(read(exactStmt, good));
+		origin = good;
 	}
-	return { rows, unreadable };
+	return { rows, damagedRegions };
 }
 
 /**

@@ -25,7 +25,7 @@ import * as path from "node:path";
 import { getHistoryDbPath } from "@oh-my-pi/pi-utils/dirs";
 import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
-import { readDamagedSqliteRows } from "@oh-my-pi/pi-utils/sqlite";
+import { onSqliteStoreQuarantine, readDamagedSqliteRows } from "@oh-my-pi/pi-utils/sqlite";
 
 const SESSION_INDEX_DDL = `
 CREATE TABLE IF NOT EXISTS session_titles (
@@ -49,6 +49,7 @@ interface SessionIndexHandle {
 	upsertTitle: Statement;
 	selectTitle: Statement;
 	insertRecap: Statement;
+	unregisterQuarantine: () => void;
 }
 
 let handle: SessionIndexHandle | undefined;
@@ -57,6 +58,7 @@ let failedPath: string | undefined;
 
 function closeHandle(): void {
 	if (!handle) return;
+	handle.unregisterQuarantine();
 	try {
 		handle.upsertTitle.finalize();
 		handle.selectTitle.finalize();
@@ -89,6 +91,9 @@ ON CONFLICT(session_id) DO UPDATE SET
 			`),
 			selectTitle: db.prepare("SELECT title FROM session_titles WHERE session_id = ?"),
 			insertRecap: db.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"),
+			// HistoryStorage may quarantine this file on corruption; drop the handle so the next
+			// call reopens the replacement (and Windows can unlink the original).
+			unregisterQuarantine: onSqliteStoreQuarantine(dbPath, closeHandle),
 		};
 		failedPath = undefined;
 		return handle;
@@ -220,12 +225,11 @@ interface SalvagedRecapRow extends SessionRecapRow {
 
 /**
  * Copies the readable session-index rows of a quarantined history.db into its
- * replacement, then drops the cached connection, which still holds the
- * quarantined file. Best-effort like the writers: failures are logged.
+ * replacement. A peer process may already have written there: a title keeps
+ * the newer of the two, and a recap whose id is taken gets a fresh one.
+ * Best-effort like the writers: failures are logged.
  */
 export function salvageSessionIndex(source: Database, target: Database): void {
-	closeHandle();
-	failedPath = undefined;
 	try {
 		const tables = new Set(
 			(source.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
@@ -239,7 +243,7 @@ export function salvageSessionIndex(source: Database, target: Database): void {
 					"session_id, title, updated_at",
 					"typeof(session_id) = 'text' AND typeof(title) = 'text' AND typeof(updated_at) = 'integer'",
 				)
-			: { rows: [], unreadable: 0 };
+			: { rows: [], damagedRegions: 0 };
 		const recaps = tables.has("session_recaps")
 			? readDamagedSqliteRows<SalvagedRecapRow>(
 					source,
@@ -247,15 +251,17 @@ export function salvageSessionIndex(source: Database, target: Database): void {
 					"id, session_id, cwd, recap, created_at",
 					"typeof(session_id) = 'text' AND typeof(cwd) = 'text' AND typeof(recap) = 'text' AND typeof(created_at) = 'integer'",
 				)
-			: { rows: [], unreadable: 0 };
+			: { rows: [], damagedRegions: 0 };
 		target.run(SESSION_INDEX_DDL);
-		// OR IGNORE: a peer process may already have written to the replacement; its rows win.
-		const insertTitle = target.query(
-			"INSERT OR IGNORE INTO session_titles (session_id, title, updated_at) VALUES (?, ?, ?)",
-		);
-		const insertRecap = target.query(
-			"INSERT OR IGNORE INTO session_recaps (id, session_id, cwd, recap, created_at) VALUES (?, ?, ?, ?, ?)",
-		);
+		const insertTitle = target.query(`
+INSERT INTO session_titles (session_id, title, updated_at) VALUES (?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at
+WHERE excluded.updated_at > session_titles.updated_at
+		`);
+		const insertRecap = target.query(`
+INSERT INTO session_recaps (id, session_id, cwd, recap, created_at)
+VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5)
+		`);
 		target.transaction(() => {
 			for (const row of titles.rows) insertTitle.run(row.session_id, row.title, row.updated_at);
 			for (const row of recaps.rows) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);
@@ -263,7 +269,7 @@ export function salvageSessionIndex(source: Database, target: Database): void {
 		logger.warn("Session index salvaged from a corrupt history store", {
 			titles: titles.rows.length,
 			recaps: recaps.rows.length,
-			unreadable: titles.unreadable + recaps.unreadable,
+			damagedRegions: titles.damagedRegions + recaps.damagedRegions,
 		});
 	} catch (error) {
 		logger.error("Session index salvage failed", { error: String(error) });

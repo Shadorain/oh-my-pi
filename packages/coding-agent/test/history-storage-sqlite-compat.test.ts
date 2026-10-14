@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
+import * as utils from "@oh-my-pi/pi-utils";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { readTableSql } from "./helpers/sqlite-inspect";
 
@@ -14,6 +15,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	HistoryStorage.close();
 	if (tempDir) {
 		await Bun.sleep(0);
@@ -254,9 +256,11 @@ it.each([
 	expect(storage.search("readable", 10).map(entry => entry.prompt)).toEqual(["readable prompt"]);
 });
 
-it("quarantines a damaged store on the rebuild pass and salvages its prompts and recaps", async () => {
-	tempDir = TempDir.createSync("@omp-history-storage-damaged-");
-	const dbPath = tempDir.join("history.db");
+/**
+ * Seeds two prompts (ids 1, 2) and a recap (id 1), then scribbles over the
+ * created_at index page only: quick_check fails, table pages stay readable.
+ */
+async function seedDamagedStore(dbPath: string, userVersion: number): Promise<void> {
 	const storage = HistoryStorage.open(dbPath);
 	await storage.add("first prompt", "/project", "session-a");
 	await storage.add("second prompt", "/project", "session-b");
@@ -272,7 +276,7 @@ it("quarantines a damaged store on the rebuild pass and salvages its prompts and
 			created_at INTEGER NOT NULL
 		);
 		INSERT INTO session_recaps (session_id, cwd, recap, created_at) VALUES ('session-a', '/project', 'kept recap', 5);
-		PRAGMA user_version = 1;
+		PRAGMA user_version = ${userVersion};
 		PRAGMA journal_mode = DELETE;
 	`);
 	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
@@ -280,10 +284,15 @@ it("quarantines a damaged store on the rebuild pass and salvages its prompts and
 		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name = 'idx_history_created_at'")
 		.get()!.rootpage;
 	raw.close();
-	// Scribble over the created_at index only: the table pages stay readable for salvage.
 	const fd = fs.openSync(dbPath, "r+");
 	fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (indexRoot - 1) * pageSize);
 	fs.closeSync(fd);
+}
+
+it("quarantines a damaged store on the rebuild pass and salvages its prompts and recaps", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-damaged-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 1);
 
 	const repaired = HistoryStorage.open(dbPath);
 	expect(repaired.getRecent(10).map(entry => entry.prompt)).toEqual(["second prompt", "first prompt"]);
@@ -299,6 +308,66 @@ it("quarantines a damaged store on the rebuild pass and salvages its prompts and
 		]);
 		expect(verify.query("SELECT session_id, recap FROM session_recaps").all()).toEqual([
 			{ session_id: "session-a", recap: "kept recap" },
+		]);
+	} finally {
+		verify.close();
+	}
+});
+
+it("repairs a current store on the next open after it reports corruption at runtime", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-runtime-damage-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 2);
+
+	expect(HistoryStorage.open(dbPath).getRecent(10)).toEqual([]);
+	HistoryStorage.close();
+
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(entry => entry.prompt),
+	).toEqual(["second prompt", "first prompt"]);
+	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
+});
+
+it("keeps a peer's rows and every salvaged row when the peer writes to the replacement first", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-salvage-race-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 1);
+	const readDamaged = utils.readDamagedSqliteRows;
+	let peerWrote = false;
+	vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation((db, table, columns, predicate) => {
+		if (!peerWrote) {
+			peerWrote = true;
+			const peer = new Database(dbPath);
+			peer.exec(`
+				INSERT INTO history (id, prompt, created_at, cwd, session_id) VALUES (1, 'peer prompt', 9000000000, '/peer', 'peer-session');
+				INSERT INTO history (id, prompt, created_at, cwd, session_id) VALUES (2, 'second prompt', 9000000001, '/peer', 'peer-session');
+				CREATE TABLE IF NOT EXISTS session_recaps (
+					id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, cwd TEXT NOT NULL,
+					recap TEXT NOT NULL, created_at INTEGER NOT NULL
+				);
+				INSERT INTO session_recaps (id, session_id, cwd, recap, created_at) VALUES (1, 'peer-session', '/peer', 'peer recap', 9);
+			`);
+			peer.close();
+		}
+		return readDamaged(db, table, columns, predicate);
+	});
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(
+		storage.getRecent(10).map(entry => ({ prompt: entry.prompt, cwd: entry.cwd, useCount: entry.useCount })),
+	).toEqual([
+		{ prompt: "second prompt", cwd: "/peer", useCount: 2 },
+		{ prompt: "peer prompt", cwd: "/peer", useCount: 1 },
+		{ prompt: "first prompt", cwd: "/project", useCount: 1 },
+	]);
+	HistoryStorage.close();
+	const verify = new Database(dbPath, { readonly: true });
+	try {
+		expect(verify.query("SELECT recap FROM session_recaps ORDER BY recap").all()).toEqual([
+			{ recap: "kept recap" },
+			{ recap: "peer recap" },
 		]);
 	} finally {
 		verify.close();
