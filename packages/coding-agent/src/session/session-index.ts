@@ -73,6 +73,7 @@ function closeHandle(): void {
 function openSessionIndex(): SessionIndexHandle | undefined {
 	const dbPath = getHistoryDbPath();
 	if (handle?.dbPath === dbPath) return handle;
+	if (failedPath === dbPath) return undefined;
 	closeHandle();
 	let db: Database | undefined;
 	try {

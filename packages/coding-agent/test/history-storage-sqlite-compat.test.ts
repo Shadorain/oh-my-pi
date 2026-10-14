@@ -9,6 +9,7 @@ import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { readTableSql } from "./helpers/sqlite-inspect";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 let tempDir: TempDir | null = null;
@@ -21,7 +22,12 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	HistoryStorage.close();
 	resetSessionIndexForTests();
-	setAgentDir(fallbackAgentDir);
+	if (originalAgentDir) {
+		setAgentDir(originalAgentDir);
+	} else {
+		setAgentDir(fallbackAgentDir);
+		delete process.env.PI_CODING_AGENT_DIR;
+	}
 	if (tempDir) {
 		await Bun.sleep(0);
 		await tempDir.remove().catch(() => {});
@@ -421,16 +427,22 @@ it("clears a failed index-open latch when the store is quarantined and replaced"
 	const dbPath = path.join(agentDir, "history.db");
 	setAgentDir(agentDir);
 
-	// A failed open latches failedPath; while it is latched every index call returns early.
+	const warnSpy = vi.spyOn(utils.logger, "warn");
+
+	// A failed open latches failedPath; repeated lookups should NOT reopen (and warn) again.
 	fs.mkdirSync(dbPath, { recursive: true });
 	expect(lookupSessionTitle("session-a")).toBeUndefined();
+	for (let i = 0; i < 5; i++) lookupSessionTitle("does-not-matter");
+	const latchWarns = warnSpy.mock.calls.length;
 	fs.rmSync(dbPath, { recursive: true });
 
-	// Quarantining a damaged store replaces it; the latch must clear so the next
-	// call reopens the replacement and sees salvaged titles.
+	// Quarantining a damaged store replaces it; the latch clears so the salvaged titles reopen.
 	await seedDamagedStore(dbPath, 1);
 	HistoryStorage.open(dbPath);
 	HistoryStorage.close();
 
 	expect(lookupSessionTitle("session-a")).toBe("kept title");
+
+	const failures = warnSpy.mock.calls.filter(c => String(c[0] || "").includes("Session index unavailable"));
+	expect(failures.length).toBe(1);
 });
