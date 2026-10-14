@@ -465,7 +465,10 @@ export function readDamagedSqliteRows<T>(
 			let skipped = origin;
 			let resumed = false;
 			for (let step = 1; ; step *= 2) {
-				const probe = Math.min(skipped + step, hi);
+				// Real rowids are positive. A damaged leftmost leaf fails every
+				// descent, so probing negative origins would never reach the
+				// live leaves — anchor at 0 and let the doubling take over.
+				const probe = Math.min(skipped < 0 ? Math.max(0, skipped + step) : skipped + step, hi);
 				// A row at `probe` itself can sit on a readable leaf while every
 				// `rowid >` path to it routes through damage.
 				const exact = read(exactStmt, probe);

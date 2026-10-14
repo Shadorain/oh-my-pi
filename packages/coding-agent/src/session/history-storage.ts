@@ -412,31 +412,36 @@ ON CONFLICT(prompt) DO UPDATE SET
 	}
 
 	/**
-	 * Runs the open-time integrity check under a single IMMEDIATE write lock,
-	 * then performs the one-time dump-and-rebuild pass when `PRAGMA
-	 * user_version` (owned by this pass — nothing else versions history.db) is
-	 * behind. The lock makes the dump snapshot the same table the DROP
-	 * replaces; otherwise a peer process could commit a prompt between the dump
-	 * and the drop and lose it. A failed check throws `SQLITE_CORRUPT` and
-	 * `open` quarantines and salvages the store instead — dropping tables on a
-	 * damaged store would free pages other b-trees still reference. Dumps every
-	 * well-formed row, folds the prompts through {@link collapseByPrompt}, and
-	 * recreates the table from {@link HISTORY_TABLE_DDL}. Subsumes every legacy
-	 * shape at once — unixepoch defaults, missing session_id, non-unique
-	 * prompt, per-line trailing padding — without per-shape SQL migrations.
-	 * Returns whether it ran so the caller can rebuild the FTS index.
+	 * Runs the open-time integrity check, then performs the one-time
+	 * dump-and-rebuild pass when `PRAGMA user_version` (owned by this pass —
+	 * nothing else versions history.db) is behind. A current store is checked
+	 * in a plain read snapshot: taking the write lock first would queue a
+	 * healthy open behind a peer's long write transaction and fail with
+	 * `SQLITE_BUSY` at the busy timeout instead of opening concurrently under
+	 * WAL. When a rebuild is needed, the whole pass runs under a single
+	 * IMMEDIATE write lock — rechecking the version inside it — so the dump
+	 * snapshots the same table the DROP replaces. A failed check throws
+	 * `SQLITE_CORRUPT` and `open` quarantines and salvages the store instead —
+	 * dropping tables on a damaged store would free pages other b-trees still
+	 * reference. Dumps every well-formed row, folds the prompts through
+	 * {@link collapseByPrompt}, and recreates the table from
+	 * {@link HISTORY_TABLE_DDL}. Subsumes every legacy shape at once — unixepoch
+	 * defaults, missing session_id, non-unique prompt, per-line trailing
+	 * padding — without per-shape SQL migrations. Returns whether it ran so the
+	 * caller can rebuild the FTS index.
 	 */
 	#rebuildHistory(): boolean {
+		const readVersion = () =>
+			this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+		if (readVersion() >= HISTORY_DATA_VERSION) {
+			assertSqliteQuickCheck(this.#db);
+			return false;
+		}
 		let rebuilt = false;
 		this.#db
 			.transaction(() => {
-				// Runs on every open, not only the rebuild pass: corruption can
-				// appear after `user_version` reaches HISTORY_DATA_VERSION, and
-				// reads that hit a damaged page otherwise surface as errors
-				// forever with no quarantine or salvage.
+				if (readVersion() >= HISTORY_DATA_VERSION) return;
 				assertSqliteQuickCheck(this.#db);
-				const versionRow = this.#db.query("PRAGMA user_version").get() as { user_version: number };
-				if (versionRow.user_version >= HISTORY_DATA_VERSION) return;
 				let rows: HistoryRow[];
 				try {
 					rows = this.#db

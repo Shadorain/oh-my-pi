@@ -354,3 +354,59 @@ test.each([
 		db.close();
 	}
 });
+
+test("damaged-row salvage recovers rows past a damaged leftmost leaf", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-salvage-leftmost-");
+	const dbPath = dir.join("store.db");
+	const total = 60;
+	const seed = new Database(dbPath);
+	seed.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)");
+	const insert = seed.prepare("INSERT INTO entries (id, value) VALUES (?, ?)");
+	for (let id = 1; id <= total; id++) insert.run(id, `${id}:${"x".repeat(1500)}`);
+	const pageSize = seed.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const pageCount = seed.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count;
+	seed.close();
+	const pristine = await fs.promises.readFile(dbPath);
+
+	// Find the leaf holding rowid 1 without dbstat: corrupt candidates until an
+	// exact seek for the smallest row fails while the largest still reads.
+	let leftmostLeaf = 0;
+	for (let pageno = 2; pageno <= pageCount; pageno++) {
+		await fs.promises.writeFile(dbPath, pristine);
+		const fd = fs.openSync(dbPath, "r+");
+		fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (pageno - 1) * pageSize);
+		fs.closeSync(fd);
+		const probe = new Database(dbPath, { readonly: true });
+		let smallestDead = false;
+		let largestLive = false;
+		try {
+			try {
+				probe.query("SELECT id FROM entries WHERE rowid = 1").get();
+			} catch {
+				smallestDead = true;
+			}
+			largestLive = probe.query("SELECT id FROM entries WHERE rowid = ?").get(total) !== null;
+		} catch {
+			largestLive = false;
+		} finally {
+			probe.close();
+		}
+		if (smallestDead && largestLive) {
+			leftmostLeaf = pageno;
+			break;
+		}
+	}
+	expect(leftmostLeaf).toBeGreaterThan(1);
+
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		const { rows, damagedRegions } = readDamagedSqliteRows<{ id: number }>(db, "entries", "id");
+		const ids = rows.map(row => row.id);
+		expect(damagedRegions).toBeGreaterThanOrEqual(1);
+		// Only the rows physically on the destroyed leaf are unrecoverable.
+		expect(ids.length).toBeGreaterThanOrEqual(total - 3);
+		expect(ids[ids.length - 1]).toBe(total);
+	} finally {
+		db.close();
+	}
+});
