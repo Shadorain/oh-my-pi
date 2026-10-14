@@ -83,22 +83,40 @@ function openSessionIndex(): SessionIndexHandle | undefined {
 		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 		db.run(`PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n${SESSION_INDEX_DDL}`);
 		const ready = db;
-		handle = {
-			dbPath,
-			db: ready,
-			upsertTitle: ready.prepare(`
+		// Statements are finalized individually before the catch's close(): an
+		// unfinalized statement defers the OS close, and Windows then refuses to
+		// unlink the store when HistoryStorage quarantines it (see gc-cli.ts).
+		const prepared: Statement[] = [];
+		try {
+			prepared.push(
+				ready.prepare(`
 INSERT INTO session_titles (session_id, title, updated_at)
 VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER))
 ON CONFLICT(session_id) DO UPDATE SET
 	title = excluded.title,
 	updated_at = excluded.updated_at
-			`),
-			selectTitle: ready.prepare("SELECT title FROM session_titles WHERE session_id = ?"),
-			insertRecap: ready.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"),
-			// HistoryStorage may quarantine this file on corruption; drop the handle so the next
-			// call reopens the replacement (and Windows can unlink the original).
-			unregisterQuarantine: onSqliteStoreQuarantine(dbPath, closeHandle),
-		};
+				`),
+				ready.prepare("SELECT title FROM session_titles WHERE session_id = ?"),
+				ready.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"),
+			);
+			handle = {
+				dbPath,
+				db: ready,
+				upsertTitle: prepared[0],
+				selectTitle: prepared[1],
+				insertRecap: prepared[2],
+				// HistoryStorage may quarantine this file on corruption; drop the handle so the next
+				// call reopens the replacement (and Windows can unlink the original).
+				unregisterQuarantine: onSqliteStoreQuarantine(dbPath, closeHandle),
+			};
+		} catch (error) {
+			for (const stmt of prepared) {
+				try {
+					stmt.finalize();
+				} catch {}
+			}
+			throw error;
+		}
 		// Published: the catch must not close `db` anymore — closeHandle owns it.
 		db = undefined;
 		failedPath = undefined;

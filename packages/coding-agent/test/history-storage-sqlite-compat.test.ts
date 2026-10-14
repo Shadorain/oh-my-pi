@@ -396,6 +396,72 @@ it("keeps a peer's rows and every salvaged row when the peer writes to the repla
 	}
 });
 
+/** Seeds a readable backup store holding one prompt that quarantine would have preserved. */
+function seedSalvageBackup(backupPath: string): void {
+	const backup = new Database(backupPath);
+	backup.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			prompt TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			cwd TEXT,
+			session_id TEXT,
+			use_count INTEGER NOT NULL DEFAULT 1
+		);
+	`);
+	backup
+		.prepare("INSERT INTO history (prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?)")
+		.run("stranded prompt", 1_700_000_000, "/project", "session-a");
+	backup.close();
+}
+
+it("salvages a recorded backup whose earlier pass was deferred", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-pending-salvage-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	// A prior open crashed or lost the write-lock race mid-salvage: only the
+	// backup and its marker remain.
+	seedSalvageBackup(backupPath);
+	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(storage.getRecent(10).map(entry => entry.prompt)).toEqual(["stranded prompt"]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
+it("defers a salvage whose insert loses the write lock to a peer, then retries it", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-busy-salvage-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	seedSalvageBackup(backupPath);
+	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+
+	// A peer takes the replacement's write lock right before the salvage insert
+	// and holds it past the busy timeout — the same race gc-cli's long
+	// transaction creates.
+	const readDamaged = utils.readDamagedSqliteRows;
+	let peer: Database | undefined;
+	vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation((db, table, columns, predicate) => {
+		const result = readDamaged(db, table, columns, predicate);
+		if (table === "history" && !peer) {
+			peer = new Database(dbPath);
+			peer.run("BEGIN IMMEDIATE");
+		}
+		return result;
+	});
+
+	const locked = HistoryStorage.open(dbPath);
+	expect(locked.getRecent(10)).toEqual([]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(true);
+	peer!.run("COMMIT");
+	peer!.close();
+	HistoryStorage.close();
+
+	const reopened = HistoryStorage.open(dbPath);
+	expect(reopened.getRecent(10).map(entry => entry.prompt)).toEqual(["stranded prompt"]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
 it("clears a failed index-open latch when the store is quarantined and replaced", async () => {
 	tempDir = TempDir.createSync("@omp-history-index-failed-latch-");
 	const dbPath = tempDir.join("history.db");

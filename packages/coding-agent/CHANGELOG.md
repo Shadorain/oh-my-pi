@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed pressing Up in the composer crashing omp with `TypeError: text.replace is not a function` when `history.db` was damaged; a damaged prompt-history store is now set aside on the next start and its readable prompts, session titles, and recaps are carried over, so history recall, search, and saving prompts work again ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+- Fixed pressing Up in the composer crashing omp with `TypeError: text.replace is not a function` when `history.db` was damaged; a damaged prompt-history store is now set aside on the next start and its readable prompts, session titles, and recaps are carried over — retrying on a later open if a peer process holds the write lock — so history recall, search, and saving prompts work again ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.11.0] - 2026-10-14
 

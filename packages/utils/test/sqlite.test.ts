@@ -28,6 +28,43 @@ async function backupNames(dirPath: string, dbName = "store.db"): Promise<string
 	return (await fs.promises.readdir(dirPath)).filter(name => name.startsWith(`${dbName}.corrupt-`));
 }
 
+/**
+ * Corrupts the leaf page whose exact seek for `smallestId` fails while
+ * `largestId` still reads — the leftmost leaf of `table` — without dbstat.
+ */
+async function corruptLeafHolding(
+	dbPath: string,
+	table: string,
+	pristine: Buffer,
+	pageSize: number,
+	pageCount: number,
+	smallestId: number,
+	largestId: number,
+): Promise<void> {
+	for (let pageno = 2; pageno <= pageCount; pageno++) {
+		await fs.promises.writeFile(dbPath, pristine);
+		const fd = fs.openSync(dbPath, "r+");
+		fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (pageno - 1) * pageSize);
+		fs.closeSync(fd);
+		const probe = new Database(dbPath, { readonly: true });
+		let smallestDead = false;
+		let largestLive = false;
+		try {
+			try {
+				probe.query(`SELECT 1 FROM ${table} WHERE rowid = ?`).get(smallestId);
+			} catch {
+				smallestDead = true;
+			}
+			largestLive = probe.query(`SELECT 1 FROM ${table} WHERE rowid = ?`).get(largestId) !== null;
+		} catch {
+			largestLive = false;
+		} finally {
+			probe.close();
+		}
+		if (smallestDead && largestLive) return;
+	}
+	throw new Error(`no leaf page holds rowid ${smallestId}`);
+}
 test("failed asynchronous initialization releases and rolls back its write transaction", async () => {
 	await using dir = await TempDir.create("@omp-sqlite-init-");
 	const dbPath = dir.join("store.db");
@@ -371,35 +408,9 @@ test.each([1, -2])("damaged-row salvage recovers past a leftmost leaf starting a
 	seed.close();
 	const pristine = await fs.promises.readFile(dbPath);
 
-	// Find the leaf holding rowid 1 without dbstat: corrupt candidates until an
-	// exact seek for the smallest row fails while the largest still reads.
-	let leftmostLeaf = 0;
-	for (let pageno = 2; pageno <= pageCount; pageno++) {
-		await fs.promises.writeFile(dbPath, pristine);
-		const fd = fs.openSync(dbPath, "r+");
-		fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (pageno - 1) * pageSize);
-		fs.closeSync(fd);
-		const probe = new Database(dbPath, { readonly: true });
-		let smallestDead = false;
-		let largestLive = false;
-		try {
-			try {
-				probe.query("SELECT id FROM entries WHERE rowid = ?").get(firstId);
-			} catch {
-				smallestDead = true;
-			}
-			largestLive = probe.query("SELECT id FROM entries WHERE rowid = ?").get(total) !== null;
-		} catch {
-			largestLive = false;
-		} finally {
-			probe.close();
-		}
-		if (smallestDead && largestLive) {
-			leftmostLeaf = pageno;
-			break;
-		}
-	}
-	expect(leftmostLeaf).toBeGreaterThan(1);
+	// Corrupt the leftmost leaf: an exact seek for the smallest rowid must fail
+	// while the largest still reads.
+	await corruptLeafHolding(dbPath, "entries", pristine, pageSize, pageCount, firstId, total);
 
 	const db = new Database(dbPath, { readonly: true });
 	try {
@@ -409,6 +420,34 @@ test.each([1, -2])("damaged-row salvage recovers past a leftmost leaf starting a
 		// Only the rows physically on the destroyed leaf are unrecoverable.
 		expect(ids.length).toBeGreaterThanOrEqual(total - 3);
 		expect(ids[ids.length - 1]).toBe(total);
+	} finally {
+		db.close();
+	}
+});
+
+test("damaged-row salvage recovers a negative-only table past a damaged leftmost leaf", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-salvage-negative-");
+	const dbPath = dir.join("store.db");
+	const total = 60;
+	const seed = new Database(dbPath);
+	seed.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)");
+	const insert = seed.prepare("INSERT INTO entries (id, value) VALUES (?, ?)");
+	for (let id = -total; id <= -1; id++) insert.run(id, `${id}:${"x".repeat(1500)}`);
+	const pageSize = seed.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const pageCount = seed.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count;
+	seed.close();
+	const pristine = await fs.promises.readFile(dbPath);
+	await corruptLeafHolding(dbPath, "entries", pristine, pageSize, pageCount, -total, -1);
+
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		const { rows, damagedRegions } = readDamagedSqliteRows<{ id: number }>(db, "entries", "id");
+		const ids = rows.map(row => row.id);
+		expect(damagedRegions).toBeGreaterThanOrEqual(1);
+		// Only the rows physically on the destroyed leaf are unrecoverable.
+		expect(ids.length).toBeGreaterThanOrEqual(total - 3);
+		expect(ids[ids.length - 1]).toBe(-1);
+		expect(ids).toEqual([...ids].sort((a, b) => a - b));
 	} finally {
 		db.close();
 	}

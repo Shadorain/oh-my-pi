@@ -391,17 +391,20 @@ type SalvageSeek = { rowid: number; ok: boolean; row: Record<string, unknown> } 
 
 /**
  * Reads every readable row of a possibly damaged rowid table. Rows are
- * visited by rowid seeks (`rowid > ?`), so work grows with the rows actually
- * stored, never with a (possibly corrupt or sparse) max rowid. Damage is not
- * monotonic — a readable leaf can sit between two damaged ones — so when a
- * seek fails, the scan probes forward with a doubling step and pushes each
- * skipped interval onto a worklist — but only when the probe found a live row:
- * a stretch whose probes are all dead is abandoned or a dead tail would
- * explode the worklist. Every probe also tries `rowid = ?`: a row whose
- * predecessor lives on a damaged page is unreachable by `rowid >` and is only
- * found by an exact seek. Rows on a damaged page are lost, and a row ringed
- * by damage on both sides may be missed. `predicate` filters rows (e.g. by
- * `typeof`) before they are returned.
+ * visited by rowid seeks (`rowid > ?`, or `rowid < ?`/`rowid <= ?` for the
+ * negative space), so work grows with the rows actually stored, never with a
+ * (possibly corrupt or sparse) max rowid. Damage is not monotonic — a
+ * readable leaf can sit between two damaged ones — so when a seek fails, the
+ * scan probes forward with a doubling step and pushes each skipped interval
+ * onto a worklist — but only when the probe found a live row strictly inside
+ * a strict sub-interval, so a queued interval can never requeue itself and a
+ * dead tail cannot explode the worklist. Every probe also tries `rowid = ?`:
+ * a row whose predecessor lives on a damaged page is unreachable by `rowid >`
+ * and is only found by an exact seek. Negative rowids sit left of every probe
+ * the forward anchor can reach, so a damage episode that starts negative
+ * queues that span for a descending sweep from 0. Rows on a damaged page are
+ * lost, and a row ringed by damage on both sides may be missed. `predicate`
+ * filters rows (e.g. by `typeof`) before they are returned.
  * `damagedRegions` — a bound on the damage, since probes may hit one region
  * repeatedly; any other error propagates.
  */
@@ -416,6 +419,12 @@ export function readDamagedSqliteRows<T>(
 		`SELECT ${selection} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT 1`,
 	);
 	const exactStmt = db.query<Record<string, unknown>, [number]>(`SELECT ${selection} FROM ${table} WHERE rowid = ?`);
+	const topStmt = db.query<Record<string, unknown>, [number]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid <= ? ORDER BY rowid DESC LIMIT 1`,
+	);
+	const prevStmt = db.query<Record<string, unknown>, [number]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid < ? ORDER BY rowid DESC LIMIT 1`,
+	);
 	let damagedRegions = 0;
 	const read = (stmt: Statement<Record<string, unknown>, [number]>, origin: number): SalvageSeek => {
 		let hit: Record<string, unknown> | null;
@@ -430,7 +439,12 @@ export function readDamagedSqliteRows<T>(
 		const { __salvage_rowid: rowid, __salvage_ok: ok, ...row } = hit;
 		if (typeof rowid !== "number" || !Number.isSafeInteger(rowid)) return "end";
 		// A cross-linked page can surface rowids out of order; treat that as damage so the scan always advances.
-		if (stmt === nextStmt && rowid <= origin) return "damaged";
+		if (
+			(stmt === nextStmt && rowid <= origin) ||
+			(stmt === topStmt && rowid > origin) ||
+			(stmt === prevStmt && rowid >= origin)
+		)
+			return "damaged";
 		return { rowid, ok: ok === 1, row };
 	};
 
@@ -442,54 +456,111 @@ export function readDamagedSqliteRows<T>(
 		if (seek.ok) kept.push({ rowid: seek.rowid, row: seek.row });
 	};
 
-	// Half-open intervals (lo, hi] of unexplored seek origins. Pushed entries
-	// always begin at a dead origin (a `rowid >` seek that hit damage), so they
-	// skip straight to probing.
-	const pending: Array<[lo: number, hi: number, deadLo: boolean]> = [
-		[Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, false],
+	// Half-open intervals (lo, hi] of unexplored seek origins, each swept in one
+	// direction: 1 ascends from `lo` with `rowid >` seeks, -1 descends from `hi`
+	// with `rowid <=`/`rowid <` seeks. `deadBoundary` marks an interval whose
+	// entry boundary is a dead probe origin; the sweep skips its entry seek and
+	// starts probing.
+	const pending: Array<[lo: number, hi: number, deadBoundary: boolean, dir: 1 | -1]> = [
+		[Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, false, 1],
 	];
 	while (pending.length > 0) {
-		const [lo, hi, deadLo] = pending.pop()!;
-		let origin = lo;
-		let seek: SalvageSeek = deadLo ? "damaged" : read(nextStmt, origin);
+		const [lo, hi, deadBoundary, dir] = pending.pop()!;
+		if (dir > 0) {
+			let origin = lo;
+			let seek: SalvageSeek = deadBoundary ? "damaged" : read(nextStmt, origin);
+			for (;;) {
+				if (seek === "end") break;
+				if (seek !== "damaged") {
+					keep(seek);
+					if (seek.rowid > hi) break;
+					origin = seek.rowid;
+					seek = read(nextStmt, origin);
+					continue;
+				}
+				// The successor of `origin` is unreadable. Negative rowids sit left
+				// of every probe the forward anchor below can reach, so that span
+				// goes to a descending sweep before probing; it self-terminates when
+				// the table holds no negatives.
+				if (origin < 0 && Math.min(0, hi) > origin) {
+					pending.push([origin, Math.min(0, hi), false, -1]);
+				}
+				// Probe forward; a skipped interval goes on the worklist only when
+				// the probe found a live row inside it.
+				let skipped = origin;
+				let resumed = false;
+				for (let step = 1; ; step *= 2) {
+					// A damaged leftmost leaf fails every descent, so probing
+					// negative origins would only burn the doubling budget - anchor
+					// at 0 and let the doubling take over.
+					const probe = Math.min(skipped < 0 ? Math.max(0, skipped + step) : skipped + step, hi);
+					// A row at `probe` itself can sit on a readable leaf while every
+					// `rowid >` path to it routes through damage.
+					const exact = read(exactStmt, probe);
+					keep(exact);
+					const hit = read(nextStmt, probe);
+					const liveInRange =
+						(typeof exact === "object" && exact.rowid > skipped && exact.rowid <= hi) ||
+						(typeof hit === "object" && hit.rowid > skipped && hit.rowid <= hi);
+					// A width-1 gap holds only the dead probe's own origin, and an
+					// entry that is not a strict sub-interval would requeue itself.
+					if (probe > skipped + 1 && (skipped > lo || probe < hi) && liveInRange) {
+						pending.push([skipped, probe, true, 1]);
+					}
+					if (hit === "damaged") {
+						if (probe === hi) break;
+						skipped = probe;
+						continue;
+					}
+					if (hit === "end") break;
+					keep(hit);
+					if (hit.rowid > hi) break;
+					origin = hit.rowid;
+					seek = read(nextStmt, origin);
+					resumed = true;
+					break;
+				}
+				if (!resumed) break;
+			}
+			continue;
+		}
+		// Descending mirror of the forward sweep for negative rowids.
+		let ceiling = hi;
+		let seek: SalvageSeek = deadBoundary ? "damaged" : read(topStmt, ceiling);
 		for (;;) {
 			if (seek === "end") break;
 			if (seek !== "damaged") {
 				keep(seek);
-				if (seek.rowid > hi) break;
-				origin = seek.rowid;
-				seek = read(nextStmt, origin);
+				if (seek.rowid <= lo) break;
+				ceiling = seek.rowid;
+				seek = read(prevStmt, ceiling);
 				continue;
 			}
-			// The successor of `origin` is unreadable. Probe forward; a skipped
-			// interval goes on the worklist only when the probe found a live row.
-			let skipped = origin;
+			// The predecessor of `ceiling` is unreadable. Probe downward with the
+			// same doubling, exact-seek, and strict-sub-interval rules.
+			let floor = ceiling;
 			let resumed = false;
 			for (let step = 1; ; step *= 2) {
-				// Anchor the initial negative origin near auto-assigned rowids.
-				const probe = Math.min(skipped < 0 ? Math.max(0, skipped + step) : skipped + step, hi);
-				// A row at `probe` itself can sit on a readable leaf while every
-				// `rowid >` path to it routes through damage.
+				const probe = Math.max(floor - step, lo);
 				const exact = read(exactStmt, probe);
 				keep(exact);
-				const hit = read(nextStmt, probe);
-				// A width-1 gap holds only the dead probe's own origin.
+				const hit = read(prevStmt, probe);
 				const liveInRange =
-					(typeof exact === "object" && exact.rowid > skipped && exact.rowid <= hi) ||
-					(typeof hit === "object" && hit.rowid > skipped && hit.rowid <= hi);
-				if (probe > skipped + 1 && (skipped > lo || probe < hi) && liveInRange) {
-					pending.push([skipped, probe, true]);
+					(typeof exact === "object" && exact.rowid > lo && exact.rowid < floor) ||
+					(typeof hit === "object" && hit.rowid > lo && hit.rowid < floor);
+				if (probe < floor - 1 && (floor < hi || probe > lo) && liveInRange) {
+					pending.push([probe, floor, true, -1]);
 				}
 				if (hit === "damaged") {
-					if (probe === hi) break;
-					skipped = probe;
+					if (probe === lo) break;
+					floor = probe;
 					continue;
 				}
 				if (hit === "end") break;
 				keep(hit);
-				if (hit.rowid > hi) break;
-				origin = hit.rowid;
-				seek = read(nextStmt, origin);
+				if (hit.rowid <= lo) break;
+				ceiling = hit.rowid;
+				seek = read(prevStmt, ceiling);
 				resumed = true;
 				break;
 			}

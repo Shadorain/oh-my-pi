@@ -5,6 +5,8 @@ import {
 	assertSqliteQuickCheck,
 	checkpointWal,
 	getHistoryDbPath,
+	isEnoent,
+	isSqliteBusyError,
 	isSqliteCorruptionError,
 	logger,
 	openSqliteDatabaseSync,
@@ -144,9 +146,40 @@ CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
 
 let cancelExitCleanup: (() => void) | undefined;
 
+/**
+ * Names the sidecar that records a quarantined store still needing salvage.
+ * A peer can hold the replacement's write lock past the busy timeout, so the
+ * salvage insert runs only when this file can be dropped afterwards.
+ */
+function pendingSalvagePath(dbPath: string): string {
+	return `${dbPath}.pending-salvage`;
+}
+
+/** Backup path recorded by a deferred salvage, if any. */
+function readPendingSalvage(dbPath: string): string | undefined {
+	try {
+		const backup = fs.readFileSync(pendingSalvagePath(dbPath), "utf8").trim();
+		return backup || undefined;
+	} catch (error) {
+		if (!isEnoent(error)) logger.warn("Pending history salvage marker unreadable", { error: String(error) });
+		return undefined;
+	}
+}
+
+/** Drops the marker only when it still names `backupPath`, so a newer marker survives. */
+function clearPendingSalvage(dbPath: string, backupPath: string): void {
+	if (readPendingSalvage(dbPath) !== backupPath) return;
+	try {
+		fs.rmSync(pendingSalvagePath(dbPath), { force: true });
+	} catch (error) {
+		logger.warn("Pending history salvage marker could not be removed", { error: String(error) });
+	}
+}
+
 /** Stores searchable prompts with only their latest project and session metadata. */
 export class HistoryStorage {
 	#db: Database;
+	#dbPath: string;
 	static #instance?: HistoryStorage;
 	#sessionResolver?: () => string | undefined;
 	#addListener?: () => void;
@@ -160,7 +193,8 @@ export class HistoryStorage {
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
 
-	private constructor(db: Database) {
+	private constructor(dbPath: string, db: Database) {
+		this.#dbPath = dbPath;
 		this.#db = db;
 
 		// One-shot statements go through the query cache, which close() finalizes; a
@@ -223,8 +257,9 @@ ON CONFLICT(prompt) DO UPDATE SET
 		return openSqliteDatabaseSync(
 			dbPath,
 			db => {
-				const instance = new HistoryStorage(db);
-				if (quarantinedPath) instance.#salvageFrom(quarantinedPath);
+				const instance = new HistoryStorage(dbPath, db);
+				const salvageSource = quarantinedPath ?? readPendingSalvage(dbPath);
+				if (salvageSource) instance.#salvageFrom(salvageSource);
 				// Exit-only: a keep-alive cleanup leaves the handle valid so the editor can
 				// keep submitting prompts; the real exit closes. Register before publishing
 				// so a real-exit-in-progress late registration cannot close this instance.
@@ -431,8 +466,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 * caller can rebuild the FTS index.
 	 */
 	#rebuildHistory(): boolean {
-		const readVersion = () =>
-			this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
+		const readVersion = () => this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
 		if (readVersion() >= HISTORY_DATA_VERSION) {
 			assertSqliteQuickCheck(this.#db);
 			return false;
@@ -496,8 +530,12 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	/**
 	 * Copies every readable, well-formed row of a quarantined store, including
-	 * the session-index tables it shares, into this fresh one. Best-effort:
-	 * failures are logged and leave this store usable.
+	 * the session-index tables it shares, into this fresh one. The prompt
+	 * insert is booked by a `<db>.pending-salvage` marker written before the
+	 * transaction and removed after it: a `SQLITE_BUSY` racing a peer's write
+	 * lock (or a crash mid-salvage) leaves the marker, so the next {@link open}
+	 * retries instead of stranding the readable prompts in the backup. Other
+	 * failures are logged, the marker is cleared, and this store stays usable.
 	 */
 	#salvageFrom(backupPath: string): void {
 		let source: Database;
@@ -505,6 +543,8 @@ ON CONFLICT(prompt) DO UPDATE SET
 			source = new Database(backupPath, { readonly: true });
 		} catch (error) {
 			logger.error("HistoryStorage salvage failed", { backupPath, error: String(error) });
+			// The recorded backup is gone or unreadable; the marker points nowhere.
+			clearPendingSalvage(this.#dbPath, backupPath);
 			return;
 		}
 		try {
@@ -515,14 +555,25 @@ ON CONFLICT(prompt) DO UPDATE SET
 				wellFormedRowClause(""),
 			);
 			const salvaged = collapseByPrompt(rows);
+			try {
+				fs.writeFileSync(pendingSalvagePath(this.#dbPath), `${backupPath}\n`);
+			} catch (error) {
+				logger.warn("Pending history salvage marker could not be written", { error: String(error) });
+			}
 			this.#db.transaction(() => this.#insertRows(salvaged))();
+			clearPendingSalvage(this.#dbPath, backupPath);
 			logger.warn("HistoryStorage salvaged prompts from a corrupt store", {
 				backupPath,
 				salvaged: salvaged.length,
 				damagedRegions,
 			});
 		} catch (error) {
-			logger.error("HistoryStorage salvage failed", { backupPath, error: String(error) });
+			if (!isSqliteBusyError(error)) clearPendingSalvage(this.#dbPath, backupPath);
+			logger.error("HistoryStorage salvage failed", {
+				backupPath,
+				deferred: isSqliteBusyError(error),
+				error: String(error),
+			});
 		}
 		try {
 			salvageSessionIndex(source, this.#db);
