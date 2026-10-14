@@ -1,16 +1,13 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { lookupSessionTitle, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import * as utils from "@oh-my-pi/pi-utils";
-import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { readTableSql } from "./helpers/sqlite-inspect";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
-const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 let tempDir: TempDir | null = null;
 
@@ -22,12 +19,6 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	HistoryStorage.close();
 	resetSessionIndexForTests();
-	if (originalAgentDir) {
-		setAgentDir(originalAgentDir);
-	} else {
-		setAgentDir(fallbackAgentDir);
-		delete process.env.PI_CODING_AGENT_DIR;
-	}
 	if (tempDir) {
 		await Bun.sleep(0);
 		await tempDir.remove().catch(() => {});
@@ -423,17 +414,14 @@ it("keeps a peer's rows and every salvaged row when the peer writes to the repla
 
 it("clears a failed index-open latch when the store is quarantined and replaced", async () => {
 	tempDir = TempDir.createSync("@omp-history-index-failed-latch-");
-	const agentDir = tempDir.join("agent");
-	const dbPath = path.join(agentDir, "history.db");
-	setAgentDir(agentDir);
-
+	const dbPath = tempDir.join("history.db");
+	vi.spyOn(utils, "getHistoryDbPath").mockReturnValue(dbPath);
 	const warnSpy = vi.spyOn(utils.logger, "warn");
 
-	// A failed open latches failedPath; repeated lookups should NOT reopen (and warn) again.
+	// A failed open latches failedPath; repeated lookups must not reopen or re-warn.
 	fs.mkdirSync(dbPath, { recursive: true });
 	expect(lookupSessionTitle("session-a")).toBeUndefined();
 	for (let i = 0; i < 5; i++) lookupSessionTitle("does-not-matter");
-	const latchWarns = warnSpy.mock.calls.length;
 	fs.rmSync(dbPath, { recursive: true });
 
 	// Quarantining a damaged store replaces it; the latch clears so the salvaged titles reopen.
