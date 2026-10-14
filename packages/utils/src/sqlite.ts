@@ -109,6 +109,20 @@ export interface SqliteOpenOptions {
 }
 
 /**
+ * Throws a `SQLITE_CORRUPT`-coded error when `PRAGMA quick_check` reports
+ * damage. A probe that itself fails propagates unchanged, so callers still see
+ * corrupt-page errors with their original SQLite codes.
+ */
+export function assertSqliteQuickCheck(db: Database): void {
+	const rows = db.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").all();
+	if (rows[0]?.quick_check === "ok") return;
+	throw Object.assign(new Error(`database disk image is malformed (${rows[0]?.quick_check})`), {
+		code: "SQLITE_CORRUPT",
+		errno: 11,
+	});
+}
+
+/**
  * Bun's multi-statement `db.run()` reports only the final statement's step
  * error (oven-sh/bun#37415), so a corrupt page hit mid-script can resurface as
  * an unrelated failure such as "no such table". When an initializer fails for
@@ -117,20 +131,19 @@ export interface SqliteOpenOptions {
  */
 function revealHiddenCorruption(db: Database | undefined, error: unknown): unknown {
 	if (!db || isSqliteCorruptionError(error) || isSqliteBusyError(error)) return error;
-	let detail: string;
-	let code: unknown = "SQLITE_CORRUPT";
-	let errno: unknown = 11;
 	try {
-		const rows = db.query<{ quick_check: string }, []>("PRAGMA quick_check(1)").all();
-		if (rows[0]?.quick_check === "ok") return error;
-		detail = `database disk image is malformed (${rows[0]?.quick_check})`;
+		assertSqliteQuickCheck(db);
+		return error;
 	} catch (probeError) {
 		if (!isSqliteCorruptionError(probeError)) return error;
-		detail = probeError instanceof Error ? probeError.message : String(probeError);
-		({ code, errno } = probeError as { code: unknown; errno?: unknown });
+		const detail = probeError instanceof Error ? probeError.message : String(probeError);
+		const { code, errno } = probeError as { code: unknown; errno?: unknown };
+		const original = error instanceof Error ? error.message : String(error);
+		return Object.assign(new Error(`${detail}; initialization failed: ${original}`, { cause: error }), {
+			code,
+			errno,
+		});
 	}
-	const original = error instanceof Error ? error.message : String(error);
-	return Object.assign(new Error(`${detail}; initialization failed: ${original}`, { cause: error }), { code, errno });
 }
 
 async function openWithBusyRetries<T>(
@@ -331,6 +344,48 @@ export function annotateSqliteError(error: unknown, dbPath: string): Error {
 /** Checkpoints committed WAL frames without waiting for concurrent readers. */
 export function checkpointWal(db: Database): void {
 	db.run("PRAGMA wal_checkpoint(PASSIVE)");
+}
+
+/**
+ * Reads every readable row of a possibly damaged rowid table, one rowid at a
+ * time: a scan aborts at the first corrupt page, while a point lookup fails only
+ * for rows behind it. Rowids are bounded by the table's max rowid and its
+ * `AUTOINCREMENT` high-water mark, whichever is readable and larger.
+ * `predicate` filters rows (e.g. by `typeof`) before they are returned.
+ * Corrupt lookups are counted as `unreadable`; any other error propagates.
+ */
+export function readDamagedSqliteRows<T>(
+	db: Database,
+	table: string,
+	columns: string,
+	predicate = "1",
+): { rows: T[]; unreadable: number } {
+	const bounds = [`SELECT max(rowid) AS id FROM ${table}`];
+	if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get()) {
+		bounds.push(`SELECT seq AS id FROM sqlite_sequence WHERE name = '${table}'`);
+	}
+	let lastRowid = 0;
+	for (const sql of bounds) {
+		try {
+			const id = db.query<{ id: unknown }, []>(sql).get()?.id;
+			if (typeof id === "number" && Number.isSafeInteger(id)) lastRowid = Math.max(lastRowid, id);
+		} catch (error) {
+			if (!isSqliteCorruptionError(error)) throw error;
+		}
+	}
+	const probe = db.query<T, [number]>(`SELECT ${columns} FROM ${table} WHERE rowid = ? AND (${predicate})`);
+	const rows: T[] = [];
+	let unreadable = 0;
+	for (let rowid = 1; rowid <= lastRowid; rowid++) {
+		try {
+			const row = probe.get(rowid);
+			if (row) rows.push(row);
+		} catch (error) {
+			if (!isSqliteCorruptionError(error)) throw error;
+			unreadable++;
+		}
+	}
+	return { rows, unreadable };
 }
 
 /**

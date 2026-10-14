@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import * as fs from "node:fs";
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -118,7 +119,7 @@ it("adds use_count to a rebuilt store in place, without another rebuild", async 
 			cwd TEXT,
 			session_id TEXT
 		);
-		PRAGMA user_version = 1;
+		PRAGMA user_version = 2;
 	`);
 	v1Db
 		.prepare("INSERT INTO history (id, prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?, ?)")
@@ -142,7 +143,7 @@ it("adds use_count to a rebuilt store in place, without another rebuild", async 
 
 	const verify = new Database(dbPath);
 	try {
-		expect(verify.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(1);
+		expect(verify.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version).toBe(2);
 	} finally {
 		verify.close();
 	}
@@ -227,5 +228,79 @@ it("reports failed writes once per outage and permits persistence after recovery
 	} finally {
 		if (peer.inTransaction) peer.run("ROLLBACK");
 		peer.close();
+	}
+});
+
+// A damaged b-tree can decode another table's BLOB as `prompt`; recalling it in
+// the editor threw "text.replace is not a function" on Up-arrow.
+it.each([
+	{ store: "a current store", userVersion: 2 },
+	{ store: "a store awaiting the rebuild pass", userVersion: 1 },
+])("never returns a non-text prompt from $store", async ({ userVersion }) => {
+	tempDir = TempDir.createSync("@omp-history-storage-blob-prompt-");
+	const dbPath = tempDir.join("history.db");
+	await HistoryStorage.open(dbPath).add("readable prompt", "/project", "session");
+	HistoryStorage.close();
+	const raw = new Database(dbPath);
+	raw.prepare("INSERT INTO history (prompt, created_at) VALUES (?, ?)").run(
+		new Uint8Array([0x30, 0x15]),
+		4_000_000_000,
+	);
+	raw.run(`PRAGMA user_version = ${userVersion}`);
+	raw.close();
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(storage.getRecent(10).map(entry => entry.prompt)).toEqual(["readable prompt"]);
+	expect(storage.search("readable", 10).map(entry => entry.prompt)).toEqual(["readable prompt"]);
+});
+
+it("quarantines a damaged store on the rebuild pass and salvages its prompts and recaps", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-damaged-");
+	const dbPath = tempDir.join("history.db");
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("first prompt", "/project", "session-a");
+	await storage.add("second prompt", "/project", "session-b");
+	HistoryStorage.close();
+
+	const raw = new Database(dbPath);
+	raw.exec(`
+		CREATE TABLE session_recaps (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			cwd TEXT NOT NULL,
+			recap TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+		INSERT INTO session_recaps (session_id, cwd, recap, created_at) VALUES ('session-a', '/project', 'kept recap', 5);
+		PRAGMA user_version = 1;
+		PRAGMA journal_mode = DELETE;
+	`);
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const indexRoot = raw
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name = 'idx_history_created_at'")
+		.get()!.rootpage;
+	raw.close();
+	// Scribble over the created_at index only: the table pages stay readable for salvage.
+	const fd = fs.openSync(dbPath, "r+");
+	fs.writeSync(fd, Buffer.alloc(pageSize, 0xff), 0, pageSize, (indexRoot - 1) * pageSize);
+	fs.closeSync(fd);
+
+	const repaired = HistoryStorage.open(dbPath);
+	expect(repaired.getRecent(10).map(entry => entry.prompt)).toEqual(["second prompt", "first prompt"]);
+	await repaired.add("after repair", "/project", "session-c");
+	expect(repaired.search("repair", 10).map(entry => entry.prompt)).toEqual(["after repair"]);
+	HistoryStorage.close();
+
+	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
+	const verify = new Database(dbPath, { readonly: true });
+	try {
+		expect(verify.query<{ integrity_check: string }, []>("PRAGMA integrity_check").all()).toEqual([
+			{ integrity_check: "ok" },
+		]);
+		expect(verify.query("SELECT session_id, recap FROM session_recaps").all()).toEqual([
+			{ session_id: "session-a", recap: "kept recap" },
+		]);
+	} finally {
+		verify.close();
 	}
 });

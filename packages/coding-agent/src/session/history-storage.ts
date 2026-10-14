@@ -1,7 +1,17 @@
-import type { Database, SQLQueryBindings, Statement } from "bun:sqlite";
+import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { checkpointWal, getHistoryDbPath, logger, openSqliteDatabaseSync, postmortem } from "@oh-my-pi/pi-utils";
+import {
+	assertSqliteQuickCheck,
+	checkpointWal,
+	getHistoryDbPath,
+	isSqliteCorruptionError,
+	logger,
+	openSqliteDatabaseSync,
+	postmortem,
+	readDamagedSqliteRows,
+} from "@oh-my-pi/pi-utils";
+import { salvageSessionIndex } from "./session-index";
 
 /** A unique prompt with provenance from its most recent submission. */
 export interface HistoryEntry {
@@ -48,6 +58,16 @@ function historyFilterClause(table: string, first: number): string {
 	return `(?${first} IS NULL OR ${table}cwd = ?${first}) AND (?${session} IS NULL OR ${table}session_id = ?${session})`;
 }
 
+/**
+ * Admits only rows with the stored shape. A damaged b-tree can surface another
+ * table's record through `history` (e.g. an FTS docsize BLOB decoded as
+ * `prompt`); TEXT affinity never coerces a BLOB, so without this a
+ * non-string `prompt` reaches callers.
+ */
+function wellFormedRowClause(table: string): string {
+	return `typeof(${table}prompt) = 'text' AND typeof(${table}created_at) = 'integer'`;
+}
+
 // Escape LIKE wildcards so user input is treated as literal text.
 // Matches the `ESCAPE '\\'` clause used by substring-search statements.
 function escapeLikePattern(text: string): string {
@@ -66,12 +86,48 @@ function normalizePrompt(prompt: string): string {
 		.replace(/[^\S\n]+\n/g, "\n")
 		.trim();
 }
+
+/**
+ * Folds rows onto their normalized prompt: the most recent submission wins
+ * (the upsert's "latest provenance" rule) and every collapsed row's use count
+ * is summed, since each was a submission.
+ */
+function collapseByPrompt(rows: HistoryRow[]): HistoryRow[] {
+	const winners = new Map<string, HistoryRow>();
+	for (const row of rows) {
+		const prompt = normalizePrompt(row.prompt);
+		if (!prompt) continue;
+		const incumbent = winners.get(prompt);
+		if (!incumbent) {
+			winners.set(prompt, { ...row, prompt });
+			continue;
+		}
+		const useCount = incumbent.use_count + row.use_count;
+		const rowWins =
+			row.created_at > incumbent.created_at || (row.created_at === incumbent.created_at && row.id > incumbent.id);
+		winners.set(prompt, rowWins ? { ...row, prompt, use_count: useCount } : { ...incumbent, use_count: useCount });
+	}
+	return [...winners.values()];
+}
+
+/** Selects the canonical row columns, defaulting those that predate `session_id` and `use_count`. */
+function historyRowColumns(db: Database): string {
+	const names = new Set(
+		(db.query("PRAGMA table_info(history)").all() as Array<{ name: string }>).map(col => col.name),
+	);
+	const sessionId = names.has("session_id") ? "session_id" : "NULL AS session_id";
+	const useCount = names.has("use_count") ? "use_count" : "1 AS use_count";
+	return `id, prompt, created_at, cwd, ${sessionId}, ${useCount}`;
+}
+
 /**
  * Bumped only when stored rows need the one-time dump-and-rebuild pass on open;
  * see `#rebuildHistory`. Purely additive columns go through `#ensureColumn`
  * instead so existing stores are never rewritten for them.
+ * v2: verify integrity first, so stores damaged under v1 are quarantined and
+ * salvaged instead of rewritten in place.
  */
-const HISTORY_DATA_VERSION = 1;
+const HISTORY_DATA_VERSION = 2;
 
 /** Canonical `history` schema; `#rebuildHistory` recreates the table from this exact DDL. */
 const HISTORY_TABLE_DDL = `
@@ -137,10 +193,10 @@ END;
 			}
 		}
 		this.#recentStmt = this.#db.prepare(
-			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
+			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${wellFormedRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
 		);
 		this.#searchStmt = this.#db.prepare(
-			`SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ?1 AND ${historyFilterClause("h.", 2)} ORDER BY h.created_at DESC, h.id DESC LIMIT ?4`,
+			`SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ?1 AND ${wellFormedRowClause("h.")} AND ${historyFilterClause("h.", 2)} ORDER BY h.created_at DESC, h.id DESC LIMIT ?4`,
 		);
 		this.#upsertRowStmt = this.#db.prepare(`
 INSERT INTO history (prompt, created_at, cwd, session_id)
@@ -153,16 +209,22 @@ ON CONFLICT(prompt) DO UPDATE SET
 		`);
 	}
 
-	/** Opens the process-wide prompt history database, quarantining a corrupt store once. */
+	/**
+	 * Opens the process-wide prompt history database. A corrupt store is
+	 * quarantined once, and its readable prompts are salvaged into the
+	 * replacement.
+	 */
 	static open(dbPath: string = getHistoryDbPath()): HistoryStorage {
 		const existing = HistoryStorage.#instance;
 		if (existing) return existing;
 
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+		let quarantinedPath: string | undefined;
 		return openSqliteDatabaseSync(
 			dbPath,
 			db => {
 				const instance = new HistoryStorage(db);
+				if (quarantinedPath) instance.#salvageFrom(quarantinedPath);
 				// Exit-only: a keep-alive cleanup leaves the handle valid so the editor can
 				// keep submitting prompts; the real exit closes. Register before publishing
 				// so a real-exit-in-progress late registration cannot close this instance.
@@ -172,7 +234,12 @@ ON CONFLICT(prompt) DO UPDATE SET
 				HistoryStorage.#instance = instance;
 				return instance;
 			},
-			{ recoverCorruption: true },
+			{
+				recoverCorruption: true,
+				onCorruptionPreserved: backupPath => {
+					quarantinedPath = backupPath;
+				},
+			},
 		);
 	}
 
@@ -346,10 +413,11 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	/**
 	 * One-time dump-and-rebuild pass, gated by `PRAGMA user_version` (owned by
-	 * this pass — nothing else versions history.db). Dumps every row, folds each
-	 * prompt through {@link normalizePrompt} in JS, keeps the most recent
-	 * submission per normalized prompt (the upsert's "latest wins" rule) with
-	 * the use counts of every collapsed row summed, and recreates the table from
+	 * this pass — nothing else versions history.db). Verifies integrity first:
+	 * dropping tables on a damaged store frees pages other b-trees still
+	 * reference, so a failed check throws `SQLITE_CORRUPT` and `open` quarantines
+	 * and salvages the store instead. Dumps every well-formed row, folds the
+	 * prompts through {@link collapseByPrompt}, and recreates the table from
 	 * {@link HISTORY_TABLE_DDL}. Subsumes every legacy shape at once — unixepoch
 	 * defaults, missing session_id, non-unique prompt, per-line trailing
 	 * padding — without per-shape SQL migrations. Returns whether it ran so the
@@ -358,50 +426,82 @@ ON CONFLICT(prompt) DO UPDATE SET
 	#rebuildHistory(): boolean {
 		const versionRow = this.#db.query("PRAGMA user_version").get() as { user_version: number };
 		if (versionRow.user_version >= HISTORY_DATA_VERSION) return false;
+		assertSqliteQuickCheck(this.#db);
 		let rows: HistoryRow[];
 		try {
-			const sessionIdSelection = this.#historySchemaHasColumn("session_id") ? "session_id" : "NULL AS session_id";
 			rows = this.#db
-				.query(`SELECT id, prompt, created_at, cwd, ${sessionIdSelection}, use_count FROM history`)
+				.query(`SELECT ${historyRowColumns(this.#db)} FROM history WHERE ${wellFormedRowClause("")}`)
 				.all() as HistoryRow[];
 		} catch (error) {
+			if (isSqliteCorruptionError(error)) throw error;
 			logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
 			return false;
 		}
-		const winners = new Map<string, HistoryRow>();
-		for (const row of rows) {
-			const prompt = normalizePrompt(row.prompt);
-			if (!prompt) continue;
-			const incumbent = winners.get(prompt);
-			if (!incumbent) {
-				winners.set(prompt, { ...row, prompt });
-				continue;
-			}
-			// Most recent submission wins, matching the upsert's "latest provenance" rule;
-			// every collapsed row still counts as a submission.
-			const useCount = incumbent.use_count + row.use_count;
-			const rowWins =
-				row.created_at > incumbent.created_at || (row.created_at === incumbent.created_at && row.id > incumbent.id);
-			winners.set(prompt, rowWins ? { ...row, prompt, use_count: useCount } : { ...incumbent, use_count: useCount });
-		}
+		const winners = collapseByPrompt(rows);
 		this.#db.transaction(() => {
 			this.#db.run("DROP INDEX IF EXISTS idx_history_created_at");
 			this.#db.run("DROP TRIGGER IF EXISTS history_ai");
 			this.#db.run("DROP TABLE IF EXISTS history_fts");
 			this.#db.run("DROP TABLE history");
 			this.#db.run(HISTORY_TABLE_DDL);
-			const insert = this.#db.query(
-				"INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count) VALUES (?, ?, ?, ?, ?, ?)",
-			);
-			for (const row of winners.values()) {
-				insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id, row.use_count);
-			}
+			this.#insertRows(winners);
 			this.#db.run(`PRAGMA user_version = ${HISTORY_DATA_VERSION}`);
 		})();
-		if (winners.size < rows.length) {
-			logger.debug("HistoryStorage collapsed rows during rebuild", { before: rows.length, after: winners.size });
+		if (winners.length < rows.length) {
+			logger.debug("HistoryStorage collapsed rows during rebuild", { before: rows.length, after: winners.length });
 		}
 		return true;
+	}
+
+	/**
+	 * Inserts rows with their original ids. `OR IGNORE`: a rebuild inserts into
+	 * an empty table, but a salvage can race a peer process that already wrote
+	 * to the replacement store, and its rows win.
+	 */
+	#insertRows(rows: HistoryRow[]): void {
+		const insert = this.#db.query(
+			"INSERT OR IGNORE INTO history (id, prompt, created_at, cwd, session_id, use_count) VALUES (?, ?, ?, ?, ?, ?)",
+		);
+		for (const row of rows) {
+			insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id, row.use_count);
+		}
+	}
+
+	/**
+	 * Copies every readable, well-formed row of a quarantined store, including
+	 * the session-index tables it shares, into this fresh one. Best-effort:
+	 * failures are logged and leave this store usable.
+	 */
+	#salvageFrom(backupPath: string): void {
+		let source: Database;
+		try {
+			source = new Database(backupPath, { readonly: true });
+		} catch (error) {
+			logger.error("HistoryStorage salvage failed", { backupPath, error: String(error) });
+			return;
+		}
+		try {
+			const { rows, unreadable } = readDamagedSqliteRows<HistoryRow>(
+				source,
+				"history",
+				historyRowColumns(source),
+				wellFormedRowClause(""),
+			);
+			const salvaged = collapseByPrompt(rows);
+			this.#db.transaction(() => this.#insertRows(salvaged))();
+			logger.warn("HistoryStorage salvaged prompts from a corrupt store", {
+				backupPath,
+				salvaged: salvaged.length,
+				unreadable,
+			});
+		} catch (error) {
+			logger.error("HistoryStorage salvage failed", { backupPath, error: String(error) });
+		}
+		try {
+			salvageSessionIndex(source, this.#db);
+		} finally {
+			source.close();
+		}
 	}
 
 	#normalizeLimit(limit: number): number {
@@ -436,7 +536,9 @@ ON CONFLICT(prompt) DO UPDATE SET
 			{ length: tokenCount },
 			(_, index) => `prompt LIKE ?${index + 1} ESCAPE '\\' COLLATE NOCASE`,
 		);
-		const whereClause = [...tokenClauses, historyFilterClause("", tokenCount + 1)].join(" AND ");
+		const whereClause = [...tokenClauses, wellFormedRowClause(""), historyFilterClause("", tokenCount + 1)].join(
+			" AND ",
+		);
 		stmt = this.#db.prepare(
 			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?${tokenCount + 3}`,
 		);
