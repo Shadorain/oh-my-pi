@@ -846,7 +846,16 @@ function appendRepeatReadHint(session: ToolSession, path: string, result: AgentT
 	const tracker = holder[kRepeatReadTracker];
 	if (tracker.size > REPEAT_READ_TRACKER_CAP) tracker.clear();
 
-	const hash = Bun.hash.xxHash64(block.text);
+	let hash = BigInt(result.content.length);
+	for (const content of result.content) {
+		hash = Bun.hash.wyhash(content.type, hash);
+		if (content.type === "text") {
+			hash = Bun.hash.wyhash(content.text, hash);
+		} else if (content.type === "image") {
+			hash = Bun.hash.wyhash(content.mimeType, hash);
+			hash = Bun.hash.wyhash(content.data, hash);
+		}
+	}
 	const entry = tracker.get(path);
 	if (!entry || entry.hash !== hash) {
 		tracker.set(path, { hash, count: 1 });

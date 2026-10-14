@@ -206,6 +206,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
 		content: [{ type: "text", text }],
+		isError: true,
 		details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
 	};
 }

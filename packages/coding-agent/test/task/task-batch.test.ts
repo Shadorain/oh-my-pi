@@ -253,6 +253,17 @@ describe("task.batch validation", () => {
 		return getFirstText(result);
 	}
 
+	it("reports missing tasks as a failed tool result instead of a successful refusal", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+		const result = await tool.execute("missing-tasks", {
+			context: "<tasks><task>Inspect the project</task></tasks>",
+		});
+
+		expect(getFirstText(result)).toContain("Missing `tasks`");
+		expect(result.isError).toBe(true);
+	});
+
 	it("rejects the stale schema argument regardless of batch mode", async () => {
 		for (const batch of [false, true]) {
 			const text = await executeText(
