@@ -1309,6 +1309,87 @@ export function cerebrasModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// 3.5 SambaNova
+// ---------------------------------------------------------------------------
+
+/** SambaNova discovery inputs: `apiKey` enables the live roster; `baseUrl` defaults to SambaNova Cloud. */
+export interface SambaNovaModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+/**
+ * One SambaNova per-token USD rate (a decimal string) as a per-million rate.
+ * `absent` is the value for a missing field; a present field that is not a
+ * nonnegative number yields `undefined`.
+ */
+function sambanovaRate(value: unknown, absent: number | undefined): number | undefined {
+	if (value === undefined || value === null) return absent;
+	const parsed = toNumber(value);
+	return parsed !== undefined && parsed >= 0 ? Math.round(parsed * 1e12) / 1e6 : undefined;
+}
+
+/**
+ * Map SambaNova's `pricing` block. Prompt and completion rates are required;
+ * cache rates default to 0 when absent. An unreadable card stays unpriced
+ * (`unknown`) instead of reading as free, and an all-zero card is a declared
+ * free tier.
+ */
+function sambanovaPricing(
+	pricing: unknown,
+	fallback: TokenCost,
+): Pick<ModelSpec<"openai-completions">, "cost" | "pricingStatus"> {
+	const rates = isRecord(pricing) ? pricing : {};
+	const input = sambanovaRate(rates.prompt, undefined);
+	const output = sambanovaRate(rates.completion, undefined);
+	const cacheRead = sambanovaRate(rates.input_cache_read, 0);
+	const cacheWrite = sambanovaRate(rates.input_cache_write, 0);
+	if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) {
+		return { cost: fallback, pricingStatus: "unknown" };
+	}
+	const cost = { input, output, cacheRead, cacheWrite };
+	return input + output + cacheRead + cacheWrite === 0 ? { cost, pricingStatus: "free" } : { cost };
+}
+
+/**
+ * SambaNova Cloud's model manager. `/v1/models` requires a key, so a keyless
+ * manager serves only the bundled seed; with a key the live roster replaces
+ * it. Rows carry pricing and limits but no capability metadata: reasoning,
+ * thinking wire format, and image input come from `providers/sambanova.kdl`.
+ */
+export function sambanovaModelManagerOptions(
+	config?: SambaNovaModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "https://api.sambanova.ai/v1";
+	return {
+		providerId: "sambanova",
+		dynamicModelsAuthoritative: true,
+		// The live `pricing` block is the tariff: an explicit `0` must not revert
+		// to the bundled seed's rate.
+		dynamicCostAuthoritative: true,
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "sambanova",
+					baseUrl,
+					apiKey,
+					filterModel: (_entry, model) => !isExcludedModel("sambanova", model.id),
+					mapModel: (entry, defaults) => ({
+						...defaults,
+						...sambanovaPricing(entry.pricing, defaults.cost),
+						contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
+						maxTokens: toPositiveNumber(entry.max_completion_tokens, defaults.maxTokens),
+					}),
+					fetch: config?.fetch,
+				}),
+		}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 4. Hugging Face
 // ---------------------------------------------------------------------------
 

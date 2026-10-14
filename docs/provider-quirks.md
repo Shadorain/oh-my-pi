@@ -1652,6 +1652,21 @@ Requests are routed through the stateful OpenAI Responses transport (`api: "open
 - **Dynamic Model Manager**: `sakanaModelManagerOptions` marks live `/models` discovery as authoritative
   (`dynamicModelsAuthoritative: true`) and purges stale cached model rows on seed changes via `dropCachedModelIdsOnStaticMismatch`.
 
+## SambaNova (`sambanova`)
+SambaNova Cloud serves open-weight models through the OpenAI Chat Completions transport at `https://api.sambanova.ai/v1`.
+
+### Special casings
+- **Thinking wire format**: `packages/catalog/src/compat/rules/providers/sambanova.kdl` sends `reasoning_effort` (low/medium/high) for gpt-oss and MiniMax M3. DeepSeek V3.1+ and Gemma 4 think only when `chat_template_kwargs.enable_thinking` is set, so they use the `qwen-chat-template` format with a single on-rung.
+- **Gemma 4 image input**: the same rule file declares `text` + `image` input for Gemma 4 and newer; `/v1/models` reports no modalities.
+
+### Auth & usage
+- **API Key Login**: `packages/catalog/src/compat/rules/auth/sambanova.kdl` declares a `login "api-key"` rule pointing at `https://cloud.sambanova.ai/apis` and validates the key against `https://api.sambanova.ai/v1/models`. Environment key: `SAMBANOVA_API_KEY`.
+
+### Catalog model handling
+- **Discovery**: `sambanovaModelManagerOptions` (`packages/catalog/src/provider-models/openai-compat.ts`) fetches `/v1/models` when a key is configured. The live roster is authoritative for models and prices (`dynamicModelsAuthoritative`, `dynamicCostAuthoritative`). Per-token USD price strings become per-million rates; an unreadable card is marked `unknown` instead of free.
+- **Roster exclusions**: embedding, Whisper/audio, and CLIP SKUs are dropped through the `exclude-models provider="sambanova"` rule in `runtime/behavior.kdl`.
+- **Authored seed**: `gpt-oss-120b` with its published $0.22 / $0.59 per 1M rate card; bundle policy `fallback`. It keeps the provider visible in `/model` before login and is replaced by the first live roster. SambaNova is credential-scoped in `generate-models.ts`, so the bundle never carries a generator account's roster.
+
 ## SiliconFlow (`siliconflow`)
 SiliconFlow is a high-performance AI inference platform providing access to open-source models (such as DeepSeek and GLM). It uses the OpenAI Chat Completions transport (`https://api.siliconflow.com/v1` for global, `https://api.siliconflow.cn/v1` for China region).
 

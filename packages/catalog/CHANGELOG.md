@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added SambaNova Cloud (`sambanova`) as a provider: `/login sambanova` with an API key, and the live `/v1/models` roster with its prices, reasoning models, and Gemma 4 image input ([#14986](https://github.com/can1357/oh-my-pi/pull/14986) by [@rjuez00](https://github.com/rjuez00))
+
 ### Fixed
 
 - Fixed OpenCode Go's `deepseek-flash` alias showing $0, unknown limits, and no reasoning instead of the V4.1 Flash rate card and capabilities ([#15357](https://github.com/can1357/oh-my-pi/issues/15357))
