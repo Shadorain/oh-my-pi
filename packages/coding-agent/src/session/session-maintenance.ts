@@ -5407,22 +5407,29 @@ export class SessionMaintenance {
 							const baseDelayMs = retrySettings.baseDelayMs * 2 ** attempt;
 							const delayMs = retryAfterMs !== undefined ? Math.max(baseDelayMs, retryAfterMs) : baseDelayMs;
 
-							// If retry delay is too long (>30s), try next candidate instead of waiting
-							const maxAcceptableDelayMs = 30_000;
-							if (delayMs > maxAcceptableDelayMs && hasMoreCandidates) {
+							// With another candidate available, a long wait is not worth it. The
+							// last candidate waits within the user's provider-wait cap
+							// (`retry.maxDelayMs`, 0 = uncapped); past it, the outer method
+							// cascade can still recover or report the failure (#15311).
+							const maxAcceptableDelayMs = hasMoreCandidates
+								? 30_000
+								: retrySettings.maxDelayMs > 0
+									? retrySettings.maxDelayMs
+									: Number.POSITIVE_INFINITY;
+							if (delayMs > maxAcceptableDelayMs) {
 								if (error instanceof NativeCompactionError) {
 									nativeCompactionFailure ??= { error, provider: candidate.provider };
 									lastError = nativeCompactionFailure.error;
 									break;
 								}
-								logger.warn("Auto-compaction retry delay too long, trying next model", {
+								logger.warn("Auto-compaction retry delay too long, advancing fallback", {
 									delayMs,
 									retryAfterMs,
 									error: message,
 									model: `${candidate.provider}/${candidate.id}`,
 								});
 								lastError = error;
-								break; // Exit retry loop, continue to next candidate
+								break; // Exit retry loop; try the next candidate or preferred method.
 							}
 
 							attempt++;
