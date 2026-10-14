@@ -83,7 +83,6 @@ function openSessionIndex(): SessionIndexHandle | undefined {
 		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 		db.run(`PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n${SESSION_INDEX_DDL}`);
 		const ready = db;
-		db = undefined;
 		handle = {
 			dbPath,
 			db: ready,
@@ -100,6 +99,8 @@ ON CONFLICT(session_id) DO UPDATE SET
 			// call reopens the replacement (and Windows can unlink the original).
 			unregisterQuarantine: onSqliteStoreQuarantine(dbPath, closeHandle),
 		};
+		// Published: the catch must not close `db` anymore — closeHandle owns it.
+		db = undefined;
 		failedPath = undefined;
 		return handle;
 	} catch (error) {

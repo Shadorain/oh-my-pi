@@ -323,49 +323,33 @@ it("quarantines a damaged store on the rebuild pass and salvages its prompts and
 	}
 });
 
-it("repairs a current store on the next open after it reports corruption at runtime", async () => {
+it("quarantines and salvages a current store damaged after the v2 rebuild", async () => {
 	tempDir = TempDir.createSync("@omp-history-storage-runtime-damage-");
 	const dbPath = tempDir.join("history.db");
 	await seedDamagedStore(dbPath, 2);
 
-	expect(HistoryStorage.open(dbPath).getRecent(10)).toEqual([]);
-	HistoryStorage.close();
-
+	// The open-time integrity check is no longer gated on the data version, so a
+	// store damaged after reaching v2 is quarantined and salvaged on the next
+	// open instead of surfacing failed reads forever.
 	expect(
 		HistoryStorage.open(dbPath)
 			.getRecent(10)
 			.map(entry => entry.prompt),
 	).toEqual(["second prompt", "first prompt"]);
+	HistoryStorage.close();
 	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
-});
 
-it("retries the repair marker when the first flag write meets a peer's write lock", async () => {
-	tempDir = TempDir.createSync("@omp-history-storage-busy-flag-");
-	const dbPath = tempDir.join("history.db");
-	await seedDamagedStore(dbPath, 2);
-
-	const storage = HistoryStorage.open(dbPath);
-	const peer = new Database(dbPath);
-	peer.exec("BEGIN IMMEDIATE");
+	const verify = new Database(dbPath, { readonly: true });
 	try {
-		// The corrupt index fails the read; flagForRepair's user_version write loses
-		// to the peer's lock, so the store is NOT flagged for repair yet.
-		expect(storage.getRecent(10)).toEqual([]);
+		expect(verify.query("SELECT session_id, title FROM session_titles").all()).toEqual([
+			{ session_id: "session-a", title: "kept title" },
+		]);
+		expect(verify.query("SELECT session_id, recap FROM session_recaps").all()).toEqual([
+			{ session_id: "session-a", recap: "kept recap" },
+		]);
 	} finally {
-		peer.exec("ROLLBACK");
-		peer.close();
+		verify.close();
 	}
-
-	// The next corruption report retries the marker; the following open repairs.
-	expect(storage.getRecent(10)).toEqual([]);
-	HistoryStorage.close();
-
-	expect(
-		HistoryStorage.open(dbPath)
-			.getRecent(10)
-			.map(entry => entry.prompt),
-	).toEqual(["second prompt", "first prompt"]);
-	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
 });
 
 it("keeps a peer's rows and every salvaged row when the peer writes to the replacement first", async () => {

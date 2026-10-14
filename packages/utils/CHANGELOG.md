@@ -6,6 +6,10 @@
 
 - Added `readDamagedSqliteRows()` to salvage readable rows from a damaged SQLite table, `assertSqliteQuickCheck()` to fail fast on a damaged store, and `onSqliteStoreQuarantine()` so long-lived connections release a corrupt store before it is quarantined ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
+### Changed
+
+- `readDamagedSqliteRows()` now explores the intervals its probes skip and tries an exact `rowid =` seek at every probe, so it recovers rows on live pages between damaged ones — including a row whose predecessor sits on a damaged page — instead of only the first row past the damage.
+
 ## [18.10.0] - 2026-10-12
 
 ### Added

@@ -345,7 +345,7 @@ test.each([
 	try {
 		const { rows, damagedRegions } = readDamagedSqliteRows<{ id: number }>(db, "entries", "id");
 		const ids = rows.map(row => row.id);
-		expect(damagedRegions).toBe(1);
+		expect(damagedRegions).toBeGreaterThanOrEqual(1);
 		expect(ids[0]).toBe(1);
 		expect(ids.length).toBeGreaterThanOrEqual(total - 2);
 		expect(ids.includes(total)).toBe(lastSurvives);

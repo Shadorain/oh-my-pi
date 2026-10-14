@@ -152,7 +152,6 @@ export class HistoryStorage {
 	#addListener?: () => void;
 	#errorListener?: (error: unknown) => void;
 	#writeFailureReported = false;
-	#repairFlagged = false;
 
 	// Prepared statements
 	#upsertRowStmt: Statement;
@@ -306,7 +305,6 @@ ON CONFLICT(prompt) DO UPDATE SET
 			this.#insertBatch([{ prompt: trimmed, cwd: cwd ?? undefined, sessionId: session || undefined }]);
 		} catch (error) {
 			logger.error("HistoryStorage add failed", { error: String(error) });
-			this.#flagForRepair(error);
 			if (!this.#writeFailureReported) {
 				this.#writeFailureReported = true;
 				this.#errorListener?.(error);
@@ -328,7 +326,6 @@ ON CONFLICT(prompt) DO UPDATE SET
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
-			this.#flagForRepair(error);
 			return [];
 		}
 	}
@@ -356,7 +353,6 @@ ON CONFLICT(prompt) DO UPDATE SET
 		} catch (error) {
 			// Malformed FTS expression - fall through to substring path.
 			logger.debug("HistoryStorage FTS query failed, using substring only", { error: String(error) });
-			this.#flagForRepair(error);
 		}
 
 		// 2. Substring fallback (token-AND LIKE). Catches infix matches FTS5's
@@ -367,7 +363,6 @@ ON CONFLICT(prompt) DO UPDATE SET
 			subRows = this.#searchSubstring(tokens, safeLimit, filter);
 		} catch (error) {
 			logger.error("HistoryStorage substring search failed", { error: String(error) });
-			this.#flagForRepair(error);
 		}
 
 		if (ftsRows.length === 0) {
@@ -417,45 +412,59 @@ ON CONFLICT(prompt) DO UPDATE SET
 	}
 
 	/**
-	 * One-time dump-and-rebuild pass, gated by `PRAGMA user_version` (owned by
-	 * this pass — nothing else versions history.db). Verifies integrity first:
-	 * dropping tables on a damaged store frees pages other b-trees still
-	 * reference, so a failed check throws `SQLITE_CORRUPT` and `open` quarantines
-	 * and salvages the store instead. Dumps every well-formed row, folds the
-	 * prompts through {@link collapseByPrompt}, and recreates the table from
-	 * {@link HISTORY_TABLE_DDL}. Subsumes every legacy shape at once — unixepoch
-	 * defaults, missing session_id, non-unique prompt, per-line trailing
-	 * padding — without per-shape SQL migrations. Returns whether it ran so the
-	 * caller can rebuild the FTS index.
+	 * Runs the open-time integrity check under a single IMMEDIATE write lock,
+	 * then performs the one-time dump-and-rebuild pass when `PRAGMA
+	 * user_version` (owned by this pass — nothing else versions history.db) is
+	 * behind. The lock makes the dump snapshot the same table the DROP
+	 * replaces; otherwise a peer process could commit a prompt between the dump
+	 * and the drop and lose it. A failed check throws `SQLITE_CORRUPT` and
+	 * `open` quarantines and salvages the store instead — dropping tables on a
+	 * damaged store would free pages other b-trees still reference. Dumps every
+	 * well-formed row, folds the prompts through {@link collapseByPrompt}, and
+	 * recreates the table from {@link HISTORY_TABLE_DDL}. Subsumes every legacy
+	 * shape at once — unixepoch defaults, missing session_id, non-unique
+	 * prompt, per-line trailing padding — without per-shape SQL migrations.
+	 * Returns whether it ran so the caller can rebuild the FTS index.
 	 */
 	#rebuildHistory(): boolean {
-		const versionRow = this.#db.query("PRAGMA user_version").get() as { user_version: number };
-		if (versionRow.user_version >= HISTORY_DATA_VERSION) return false;
-		assertSqliteQuickCheck(this.#db);
-		let rows: HistoryRow[];
-		try {
-			rows = this.#db
-				.query(`SELECT ${historyRowColumns(this.#db)} FROM history WHERE ${wellFormedRowClause("")}`)
-				.all() as HistoryRow[];
-		} catch (error) {
-			if (isSqliteCorruptionError(error)) throw error;
-			logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
-			return false;
-		}
-		const winners = collapseByPrompt(rows);
-		this.#db.transaction(() => {
-			this.#db.run("DROP INDEX IF EXISTS idx_history_created_at");
-			this.#db.run("DROP TRIGGER IF EXISTS history_ai");
-			this.#db.run("DROP TABLE IF EXISTS history_fts");
-			this.#db.run("DROP TABLE history");
-			this.#db.run(HISTORY_TABLE_DDL);
-			this.#insertRows(winners);
-			this.#db.run(`PRAGMA user_version = ${HISTORY_DATA_VERSION}`);
-		})();
-		if (winners.length < rows.length) {
-			logger.debug("HistoryStorage collapsed rows during rebuild", { before: rows.length, after: winners.length });
-		}
-		return true;
+		let rebuilt = false;
+		this.#db
+			.transaction(() => {
+				// Runs on every open, not only the rebuild pass: corruption can
+				// appear after `user_version` reaches HISTORY_DATA_VERSION, and
+				// reads that hit a damaged page otherwise surface as errors
+				// forever with no quarantine or salvage.
+				assertSqliteQuickCheck(this.#db);
+				const versionRow = this.#db.query("PRAGMA user_version").get() as { user_version: number };
+				if (versionRow.user_version >= HISTORY_DATA_VERSION) return;
+				let rows: HistoryRow[];
+				try {
+					rows = this.#db
+						.query(`SELECT ${historyRowColumns(this.#db)} FROM history WHERE ${wellFormedRowClause("")}`)
+						.all() as HistoryRow[];
+				} catch (error) {
+					if (isSqliteCorruptionError(error)) throw error;
+					logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
+					return;
+				}
+				const winners = collapseByPrompt(rows);
+				this.#db.run("DROP INDEX IF EXISTS idx_history_created_at");
+				this.#db.run("DROP TRIGGER IF EXISTS history_ai");
+				this.#db.run("DROP TABLE IF EXISTS history_fts");
+				this.#db.run("DROP TABLE history");
+				this.#db.run(HISTORY_TABLE_DDL);
+				this.#insertRows(winners);
+				this.#db.run(`PRAGMA user_version = ${HISTORY_DATA_VERSION}`);
+				rebuilt = true;
+				if (winners.length < rows.length) {
+					logger.debug("HistoryStorage collapsed rows during rebuild", {
+						before: rows.length,
+						after: winners.length,
+					});
+				}
+			})
+			.immediate();
+		return rebuilt;
 	}
 
 	/**
@@ -477,26 +486,6 @@ ON CONFLICT(prompt) DO UPDATE SET
 		`);
 		for (const row of rows) {
 			insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id, row.use_count);
-		}
-	}
-
-	/**
-	 * The open-time integrity check runs only in the data pass, so a store that
-	 * reports corruption later resets `user_version` to re-arm it: the next
-	 * open verifies the store, then quarantines and salvages it if damaged.
-	 */
-	#flagForRepair(error: unknown): void {
-		if (this.#repairFlagged || !isSqliteCorruptionError(error)) return;
-		try {
-			// Latch only after the marker lands: a BUSY peer can abort this write, and the
-			// next corruption report must be able to retry it.
-			this.#db.run("PRAGMA user_version = 0");
-			this.#repairFlagged = true;
-			logger.warn("HistoryStorage store reported corruption; it will be verified and repaired on next start", {
-				error: String(error),
-			});
-		} catch (flagError) {
-			logger.error("HistoryStorage could not flag the store for repair", { error: String(flagError) });
 		}
 	}
 
