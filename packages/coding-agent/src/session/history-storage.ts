@@ -487,9 +487,11 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 */
 	#flagForRepair(error: unknown): void {
 		if (this.#repairFlagged || !isSqliteCorruptionError(error)) return;
-		this.#repairFlagged = true;
 		try {
+			// Latch only after the marker lands: a BUSY peer can abort this write, and the
+			// next corruption report must be able to retry it.
 			this.#db.run("PRAGMA user_version = 0");
+			this.#repairFlagged = true;
 			logger.warn("HistoryStorage store reported corruption; it will be verified and repaired on next start", {
 				error: String(error),
 			});

@@ -55,6 +55,8 @@ interface SessionIndexHandle {
 let handle: SessionIndexHandle | undefined;
 /** Db path whose open failed; skip retries (and log spam) until the path changes. */
 let failedPath: string | undefined;
+/** One quarantine-clearing hook per {@link failedPath}; self-unregisters once it fires. */
+let failedPathUnregister: (() => void) | undefined;
 
 function closeHandle(): void {
 	if (!handle) return;
@@ -71,26 +73,28 @@ function closeHandle(): void {
 function openSessionIndex(): SessionIndexHandle | undefined {
 	const dbPath = getHistoryDbPath();
 	if (handle?.dbPath === dbPath) return handle;
-	if (failedPath === dbPath) return undefined;
 	closeHandle();
+	let db: Database | undefined;
 	try {
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-		const db = new Database(dbPath);
+		db = new Database(dbPath);
 		// Install the busy handler BEFORE any lock-taking statement (see #2421).
 		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
 		db.run(`PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n${SESSION_INDEX_DDL}`);
+		const ready = db;
+		db = undefined;
 		handle = {
 			dbPath,
-			db,
-			upsertTitle: db.prepare(`
+			db: ready,
+			upsertTitle: ready.prepare(`
 INSERT INTO session_titles (session_id, title, updated_at)
 VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER))
 ON CONFLICT(session_id) DO UPDATE SET
 	title = excluded.title,
 	updated_at = excluded.updated_at
 			`),
-			selectTitle: db.prepare("SELECT title FROM session_titles WHERE session_id = ?"),
-			insertRecap: db.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"),
+			selectTitle: ready.prepare("SELECT title FROM session_titles WHERE session_id = ?"),
+			insertRecap: ready.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"),
 			// HistoryStorage may quarantine this file on corruption; drop the handle so the next
 			// call reopens the replacement (and Windows can unlink the original).
 			unregisterQuarantine: onSqliteStoreQuarantine(dbPath, closeHandle),
@@ -99,6 +103,16 @@ ON CONFLICT(session_id) DO UPDATE SET
 		return handle;
 	} catch (error) {
 		failedPath = dbPath;
+		// A failed open must not pin the file: quarantine needs to unlink it (Windows),
+		// and the latch clears once a quarantined store is replaced.
+		db?.close();
+		if (failedPathUnregister) failedPathUnregister();
+		const hook = onSqliteStoreQuarantine(dbPath, () => {
+			if (failedPath === dbPath) failedPath = undefined;
+			failedPathUnregister = undefined;
+			hook();
+		});
+		failedPathUnregister = hook;
 		logger.warn("Session index unavailable", { dbPath, error: String(error) });
 		return undefined;
 	}
@@ -280,4 +294,6 @@ VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = ?1) THEN NULL 
 export function resetSessionIndexForTests(): void {
 	closeHandle();
 	failedPath = undefined;
+	failedPathUnregister?.();
+	failedPathUnregister = undefined;
 }

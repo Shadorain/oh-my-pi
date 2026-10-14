@@ -1,12 +1,15 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
+import { lookupSessionTitle, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import * as utils from "@oh-my-pi/pi-utils";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { readTableSql } from "./helpers/sqlite-inspect";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
+const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 let tempDir: TempDir | null = null;
 
@@ -17,6 +20,8 @@ beforeEach(() => {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	HistoryStorage.close();
+	resetSessionIndexForTests();
+	setAgentDir(fallbackAgentDir);
 	if (tempDir) {
 		await Bun.sleep(0);
 		await tempDir.remove().catch(() => {});
@@ -257,8 +262,9 @@ it.each([
 });
 
 /**
- * Seeds two prompts (ids 1, 2) and a recap (id 1), then scribbles over the
- * created_at index page only: quick_check fails, table pages stay readable.
+ * Seeds two prompts (ids 1, 2), a title, and a recap (id 1), then scribbles
+ * over the created_at index page only: quick_check fails, table pages stay
+ * readable.
  */
 async function seedDamagedStore(dbPath: string, userVersion: number): Promise<void> {
 	const storage = HistoryStorage.open(dbPath);
@@ -268,6 +274,12 @@ async function seedDamagedStore(dbPath: string, userVersion: number): Promise<vo
 
 	const raw = new Database(dbPath);
 	raw.exec(`
+		CREATE TABLE session_titles (
+			session_id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO session_titles (session_id, title, updated_at) VALUES ('session-a', 'kept title', 5);
 		CREATE TABLE session_recaps (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -330,6 +342,35 @@ it("repairs a current store on the next open after it reports corruption at runt
 	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
 });
 
+it("retries the repair marker when the first flag write meets a peer's write lock", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-busy-flag-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 2);
+
+	const storage = HistoryStorage.open(dbPath);
+	const peer = new Database(dbPath);
+	peer.exec("BEGIN IMMEDIATE");
+	try {
+		// The corrupt index fails the read; flagForRepair's user_version write loses
+		// to the peer's lock, so the store is NOT flagged for repair yet.
+		expect(storage.getRecent(10)).toEqual([]);
+	} finally {
+		peer.exec("ROLLBACK");
+		peer.close();
+	}
+
+	// The next corruption report retries the marker; the following open repairs.
+	expect(storage.getRecent(10)).toEqual([]);
+	HistoryStorage.close();
+
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(entry => entry.prompt),
+	).toEqual(["second prompt", "first prompt"]);
+	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
+});
+
 it("keeps a peer's rows and every salvaged row when the peer writes to the replacement first", async () => {
 	tempDir = TempDir.createSync("@omp-history-storage-salvage-race-");
 	const dbPath = tempDir.join("history.db");
@@ -372,4 +413,24 @@ it("keeps a peer's rows and every salvaged row when the peer writes to the repla
 	} finally {
 		verify.close();
 	}
+});
+
+it("clears a failed index-open latch when the store is quarantined and replaced", async () => {
+	tempDir = TempDir.createSync("@omp-history-index-failed-latch-");
+	const agentDir = tempDir.join("agent");
+	const dbPath = path.join(agentDir, "history.db");
+	setAgentDir(agentDir);
+
+	// A failed open latches failedPath; while it is latched every index call returns early.
+	fs.mkdirSync(dbPath, { recursive: true });
+	expect(lookupSessionTitle("session-a")).toBeUndefined();
+	fs.rmSync(dbPath, { recursive: true });
+
+	// Quarantining a damaged store replaces it; the latch must clear so the next
+	// call reopens the replacement and sees salvaged titles.
+	await seedDamagedStore(dbPath, 1);
+	HistoryStorage.open(dbPath);
+	HistoryStorage.close();
+
+	expect(lookupSessionTitle("session-a")).toBe("kept title");
 });
