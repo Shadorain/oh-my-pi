@@ -957,6 +957,21 @@ export function parseKittyDirectPlacementLine(line: string): ParsedKittyPlacemen
 	};
 }
 
+/** `ESC 7` + `CUU(n)` lead-in of an {@link Image} direct-placement line. */
+const DIRECT_PLACEMENT_LIFT = /^\x1b7\x1b\[(\d+)A/;
+
+/**
+ * Rows above its own line that an {@link Image} direct-placement line paints
+ * over: the `CUU(rows-1)` of its lead-in, or 0 for any other line. The renderer
+ * erases those rows before a SIXEL/iTerm2 block is written again, because
+ * those protocols have no delete command and the block's reserved rows are
+ * byte-identical between frames, so the diff never rewrites them.
+ */
+export function directPlacementLift(line: string): number {
+	const m = DIRECT_PLACEMENT_LIFT.exec(line);
+	return m ? Number(m[1]) : 0;
+}
+
 /**
  * Rebuild an {@link Image} direct-placement line for the viewport row it is
  * written at. The component-rendered line encodes `CUU(rows-1)`, which clamps

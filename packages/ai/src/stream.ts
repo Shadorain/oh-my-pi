@@ -2110,6 +2110,7 @@ function mapOptionsForApi<TApi extends Api>(
 				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
+				disableReasoning: options?.disableReasoning,
 				forceReasoningOff: options?.forceReasoningOff,
 			});
 

@@ -33,6 +33,19 @@ provider "opencode-go" {
 			max-tokens 384000
 		}
 	}
+	// Live Go discovery lists Argon without capabilities; its native Gemini
+	// endpoint requires a thinking level and accepts LOW, MEDIUM, or HIGH.
+	models "gemini-4-argon-contributor" {
+		thinking-upgrade-neutral #true
+		thinking-mode "google-level"
+		thinking-efforts "low" "medium" "high"
+		thinking-requires-effort #true
+		input-modalities "text" "image"
+		limits-patch {
+			context-window 1048576
+			max-tokens 65536
+		}
+	}
 	// Replaces the OpenCode reasoning-model whenThinking fallback object.
 	when-thinking {
 		requires-reasoning-content-for-tool-calls #true

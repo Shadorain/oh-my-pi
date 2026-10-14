@@ -2,9 +2,12 @@
 
 ## [Unreleased]
 
+## [18.11.0] - 2026-10-14
+
 ### Breaking Changes
 
 - Removed `ApprovalDetailsOptions`; `formatApprovalDetails` takes only `args` again, since the compact approval prompt no longer shows tool details ([#15642](https://github.com/can1357/oh-my-pi/pull/15642) by [@H4vC](https://github.com/H4vC))
+
 ### Added
 
 - `AgentTool.delegationGuidance`: instructions a same-name extension replacement inherits in its description when it delegates to the native tool ([#15477](https://github.com/can1357/oh-my-pi/pull/15477) by [@iliaal](https://github.com/iliaal))
@@ -14,6 +17,8 @@
 
 - Fixed native (OpenAI/Codex) remote compaction refusing or truncating sessions that fit the window: its preflight counted the JSON-escaped request, inflating quote-, backslash- and newline-heavy tool output such as disassembly by ~10–20%; it now counts text as the model reads it ([#15712](https://github.com/can1357/oh-my-pi/pull/15712) by [@H4vC](https://github.com/H4vC))
 - Fixed OpenAI V1/V2 remote compaction failing outright when the history, kept tail included, exceeds the context window (a large final response or tool output after the last check); it retries on the history before the kept tail ([#15712](https://github.com/can1357/oh-my-pi/pull/15712) by [@H4vC](https://github.com/H4vC))
+- Fixed fitted output caps overflowing the context window on strict hosts (llama.cpp-family) after turns with many parallel tool results; chat-template framing is now charged per locally counted message ([#15699](https://github.com/can1357/oh-my-pi/issues/15699))
+- Fixed leaked DeepSeek DSML markup reaching saved history from reasoning blocks and from turns that also made a valid tool call ([#15485](https://github.com/can1357/oh-my-pi/issues/15485))
 
 ## [18.10.4] - 2026-10-13
 

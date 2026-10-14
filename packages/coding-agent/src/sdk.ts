@@ -777,6 +777,8 @@ export interface CreateAgentSessionOptions {
 	skipPythonPreflight?: boolean;
 	/** Tool names explicitly requested (enables disabled-by-default tools) */
 	toolNames?: string[];
+	/** Names from `toolNames` that a fork inherits as `xd://` devices rather than explicit top-level tools. */
+	mountedToolNames?: string[];
 	/** Limit the session to explicitly supplied tool names, without discovered extras. */
 	restrictToolNames?: boolean;
 	/**
@@ -870,6 +872,8 @@ export interface CreateAgentSessionOptions {
 	 * keeps saved-reset consent off the extension UI context. Default: `hasUI`.
 	 */
 	interactivePrompts?: boolean;
+	/** Keep `ask` advertised in a headless fork sharing a parent's tool-schema prefix; calls still fail without UI. */
+	advertiseHeadlessAsk?: boolean;
 	/**
 	 * The user approves agent `cfg://` settings writes through the process-global
 	 * host (`setCfgApprovalHost`). Only the top-level TUI session sets this; every
@@ -2269,6 +2273,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
 			canPromptUser: options.interactivePrompts ?? options.hasUI ?? false,
+			advertiseHeadlessAsk: options.advertiseHeadlessAsk,
 			settingsApproval: options.settingsApproval === true && !isSubagentSession,
 			// Explicit resolvers retain their existing pass-through contract. Ordinary
 			// sessions inherit stored affinity into the child's own provider session.
@@ -3820,7 +3825,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 			const memoryBackend = restrictToolNames ? undefined : await resolveMemoryBackend(settings);
 			const memoryInstructions = memoryBackend
-				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, session)
+				? await memoryBackend.buildDeveloperInstructions(agentDir, sessionManager.getCwd(), settings, session)
 				: undefined;
 			// Advisors get the same memory block (sharpshooter decisions, mnemopi/
 			// hindsight instructions) wrapped as shared background knowledge; the
@@ -4037,6 +4042,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;
+		const inheritedMountedNames = options.mountedToolNames && new Set(options.mountedToolNames);
+		const presentationPinnedToolNames =
+			explicitlyRequestedToolNames && inheritedMountedNames
+				? new Set(explicitlyRequestedToolNames.filter(name => !inheritedMountedNames.has(name)))
+				: explicitlyRequestedToolNameSet;
 		const xdevReadAvailable =
 			builtInRegistryToolNames.has("read") &&
 			(explicitlyRequestedToolNameSet === undefined || explicitlyRequestedToolNameSet.has("read"));
@@ -4114,7 +4124,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const mountedNames: string[] = [];
 			for (const name of initialToolNames) {
 				const tool = toolRegistry.get(name);
-				const explicitlyRequested = explicitlyRequestedToolNameSet?.has(name) === true;
+				const explicitlyRequested = presentationPinnedToolNames?.has(name) === true;
 				if (tool && xdevReadAvailable && xdevWriteAvailable && !explicitlyRequested && isMountableUnderXdev(tool))
 					mountedNames.push(name);
 				else topLevelToolNames.push(name);
@@ -4649,7 +4659,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			rebuildSystemPrompt,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
 			xdev: toolSession.xdev,
-			presentationPinnedToolNames: explicitlyRequestedToolNameSet,
+			presentationPinnedToolNames,
 			setActiveToolNames: setSessionActiveToolNames,
 			ensureWriteRegistered,
 			isDeviceOnlyWrite: () => toolSession.deviceOnlyWrite === true,

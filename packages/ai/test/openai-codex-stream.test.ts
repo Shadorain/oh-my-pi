@@ -721,6 +721,38 @@ describe("openai-codex streaming", () => {
 		expect(capturedBody?.text).toBeUndefined();
 	});
 
+	it.each([
+		["lowest-effort", { effort: "low" }],
+		["none-effort", { effort: "none" }],
+	] as const)("honors disableReasoning over a requested effort on a %s model", async (disableMode, expected) => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const base = createCodexTestModel("https://chatgpt.com/backend-api");
+		const model = {
+			...base,
+			preferWebsockets: false,
+			compat: { ...base.compat, reasoningDisableMode: disableMode },
+		};
+		let capturedBody: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = async (_input, init) => {
+			capturedBody = JSON.parse(decodeCodexRequestBody(init?.body)) as Record<string, unknown>;
+			return new Response(createCompletedCodexSse("Hello"), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+
+		const result = await streamSimple(model, createCodexTestContext(), {
+			apiKey: createCodexTestToken(),
+			fetch: fetchMock,
+			reasoning: Effort.High,
+			disableReasoning: true,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(capturedBody?.reasoning).toEqual(expected);
+	});
+
 	async function runCodexSseEvents(events: unknown[]) {
 		const token = createCodexTestToken();
 		const context = createCodexTestContext();

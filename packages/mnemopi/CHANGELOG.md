@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.11.0] - 2026-10-14
+
 ### Fixed
 
 - Fixed polyphonic recall ranking unrelated memories above relevant ones when the query shared only a common word such as "that" with an extracted fact subject ([#15512](https://github.com/can1357/oh-my-pi/issues/15512)).

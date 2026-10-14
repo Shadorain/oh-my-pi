@@ -727,32 +727,61 @@ describe("OpenCode provider discovery", () => {
 
 	test("routes opencode-go deepseek-v4-flash to the responses API", () => {
 		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
-		// stencil.so lists deepseek-v4-flash without provider.npm, so it would
-		// fall through to openai-completions — but the Go gateway does not serve
-		// this model at /zen/go/v1/chat/completions while /zen/go/v1/responses
-		// works (user-verified against the live gateway, 2026-08-08).
+		// The gateway serves Flash on /v1/responses, not /v1/chat/completions;
+		// the catalog has no npm hint to distinguish it (verified 2026-08-08).
 		expect(descriptor?.resolveApi?.("deepseek-v4-flash", { tool_call: true })).toEqual({
 			api: "openai-responses",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
 		// Flash only: deepseek-v4-pro serves fine on chat completions.
 		expect(descriptor?.resolveApi?.("deepseek-v4-pro", { tool_call: true })).toEqual({
 			api: "openai-completions",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
+	});
+
+	test("routes live Go Argon to native Gemini with supported thinking levels (#15722)", async () => {
+		const id = "gemini-4-argon-contributor";
+		const baseUrl = "https://opencode.ai/inference/go/v1";
+		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
+		expect(descriptor?.resolveApi?.(id, { tool_call: true })).toEqual({ api: "google-generative-ai", baseUrl });
+
+		let requestedUrl = "";
+		const options = opencodeGoModelManagerOptions({
+			apiKey: "test-key",
+			fetch: async input => {
+				requestedUrl = String(input);
+				return modelListResponse([id]);
+			},
+		});
+		const spec = (await options.fetchDynamicModels?.())?.find(model => model.id === id);
+		if (!spec) throw new Error("Go did not discover Argon");
+		const model = buildModel(spec);
+		expect(requestedUrl).toBe(`${baseUrl}/models`);
+		expect(model).toMatchObject({
+			api: "google-generative-ai",
+			baseUrl,
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_048_576,
+			maxTokens: 65_536,
+			thinking: {
+				mode: "google-level",
+				efforts: [Effort.Low, Effort.Medium, Effort.High],
+				requiresEffort: true,
+			},
+		});
+		expect(options.dropCachedModelIdsOnStaticMismatch).toContain(id);
 	});
 
 	test("routes opencode-go muse-spark-1.2 to the responses API (#8957)", () => {
 		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
-		// The Go /zen/go/v1/models discovery drops the provider.npm hint for the
-		// muse-spark ids, so without an override they fall through to
-		// openai-completions even though the gateway only serves them at
-		// /zen/go/v1/responses. Sending completions requests closes the stream
-		// with no finish_reason on every tool-call turn.
+		// Go's live model list omits transport metadata for these ids; the
+		// gateway serves them on /v1/responses, not chat completions.
 		for (const id of ["muse-spark-1.2", "muse-spark-1.2-contributor"]) {
 			expect(descriptor?.resolveApi?.(id, { tool_call: true })).toEqual({
 				api: "openai-responses",
-				baseUrl: "https://opencode.ai/zen/go/v1",
+				baseUrl: "https://opencode.ai/inference/go/v1",
 			});
 		}
 	});
@@ -766,7 +795,7 @@ describe("OpenCode provider discovery", () => {
 		const goDescriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
 		expect(goDescriptor?.resolveApi?.("muse-spark-1.3-contributor", { tool_call: true })).toEqual({
 			api: "openai-responses",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
 		const zenDescriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-zen");
 		expect(zenDescriptor?.resolveApi?.("muse-spark-1.3-contributor-free", { tool_call: true })).toEqual({
@@ -777,7 +806,7 @@ describe("OpenCode provider discovery", () => {
 
 	test("routes gateway-listed Union Alpha to Messages on Go and Zen (#12359)", async () => {
 		for (const [makeOptions, baseUrl] of [
-			[opencodeGoModelManagerOptions, "https://opencode.ai/zen/go"],
+			[opencodeGoModelManagerOptions, "https://opencode.ai/inference/go"],
 			[opencodeZenModelManagerOptions, "https://opencode.ai/zen"],
 		] as const) {
 			const options = makeOptions({
@@ -822,7 +851,7 @@ describe("OpenCode provider discovery", () => {
 		const [goModels, zenModels] = await Promise.all([go.fetchDynamicModels?.(), zen.fetchDynamicModels?.()]);
 		expect(goModels?.find(model => model.id === "muse-spark-1.4-contributor")).toMatchObject({
 			api: "openai-responses",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
 		expect(zenModels?.find(model => model.id === "muse-spark-1.4-contributor-free")).toMatchObject({
 			api: "openai-responses",
@@ -865,7 +894,7 @@ describe("OpenCode provider discovery", () => {
 		for (const id of ["muse-spark-1.2", "muse-spark-1.2-contributor"]) {
 			expect(byId.get(id)).toMatchObject({
 				api: "openai-responses",
-				baseUrl: "https://opencode.ai/zen/go/v1",
+				baseUrl: "https://opencode.ai/inference/go/v1",
 			});
 		}
 		// Contrast: an unpinned id with a bundled reference keeps its route.
