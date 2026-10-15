@@ -1346,6 +1346,7 @@ async fn run_shell_command_once(
 	params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+	register_background_jobs(&session.shell, &spawn_registry);
 	params.set_cancel_token(cancel_token.clone());
 	params.set_spawn_observer(spawn_registry.clone());
 	// Only a buffered capture can be minimized, so only it asks for the report.
@@ -1413,7 +1414,7 @@ async fn run_shell_command_once(
 	drop(diagnostics);
 
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&mut session.shell);
+		terminate_background_jobs(&mut session.shell, &spawn_registry).await;
 	}
 
 	drop(params);
@@ -1520,6 +1521,7 @@ async fn run_shell_command_streams_in_filesystem(
 	params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
+	register_background_jobs(&session.shell, &spawn_registry);
 	params.set_cancel_token(cancel_token.clone());
 	params.set_spawn_observer(spawn_registry.clone());
 	let reader_cancel = CancellationToken::new();
@@ -1562,7 +1564,7 @@ async fn run_shell_command_streams_in_filesystem(
 	drop(diagnostics);
 
 	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&mut session.shell);
+		terminate_background_jobs(&mut session.shell, &spawn_registry).await;
 	}
 
 	if env_scope_pushed {
@@ -1732,41 +1734,50 @@ async fn terminate_run(registry: &process::SpawnRegistry) {
 			targets.signal(signal);
 		}
 		if wave + 1 < WAVES {
-			let pause = if wave == 0 {
-				Duration::from_millis(75)
+			if wave == 0 {
+				wait_for_term_grace(registry).await;
 			} else {
-				Duration::from_millis(150)
-			};
-			time::sleep(pause).await;
+				time::sleep(Duration::from_millis(150)).await;
+			}
 		}
 	}
 }
 
-fn terminate_background_jobs(shell: &mut BrushShell) {
-	let mut targets = process::TerminationTargets::new();
+async fn wait_for_term_grace(registry: &process::SpawnRegistry) {
+	// Windows TERM is already hard termination; there is no trap to wait for.
+	#[cfg(unix)]
+	{
+		let deadline = time::Instant::now() + Duration::from_secs(1);
+		while !registry.build_targets().is_empty() {
+			let now = time::Instant::now();
+			if now >= deadline {
+				break;
+			}
+			time::sleep_until((now + Duration::from_millis(25)).min(deadline)).await;
+		}
+	}
+	#[cfg(not(unix))]
+	let _ = registry;
+}
+
+fn register_background_jobs(shell: &BrushShell, registry: &process::SpawnRegistry) {
+	// Include retained session jobs in the same cancellation wave as new spawns.
+	for job in &shell.jobs().jobs {
+		let process = job
+			.representative_pid()
+			.and_then(process::Process::from_pid);
+		registry.record(job.process_group_id(), process);
+	}
+}
+
+async fn terminate_background_jobs(shell: &mut BrushShell, registry: &process::SpawnRegistry) {
+	// The run's cancellation bridge owns TERM/KILL, including background jobs.
+	// Aborting their internal tasks sooner drops ChildProcess and hard-kills
+	// children while their TERM traps are still running.
+	wait_for_term_grace(registry).await;
 	for job in &mut shell.jobs_mut().jobs {
 		job.abort_internal_tasks();
 	}
-	for job in &shell.jobs().jobs {
-		if let Some(pgid) = job.process_group_id() {
-			targets.add_pgid(pgid);
-		}
-		if let Some(pid) = job.representative_pid() {
-			targets.add_pid(pid);
-		}
-	}
-	if targets.is_empty() {
-		// Shell-internal jobs were aborted above. Pure descendant cleanup is
-		// handled by `process_cancel_bridge` while the cancel was in flight;
-		// without job-tracked pgids or pids there is nothing else to signal here.
-		return;
-	}
-
-	targets.signal(process::TERM_SIGNAL);
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(150)).await;
-		targets.signal(process::KILL_SIGNAL);
-	});
 }
 
 /// Apply per-command environment variables onto a freshly pushed
@@ -2206,7 +2217,6 @@ mod tests {
 	#[cfg(unix)]
 	use std::os::unix::process::ExitStatusExt as _;
 
-	#[cfg(unix)]
 	use tokio::process::Command;
 
 	use super::*;
@@ -6919,6 +6929,70 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 			child_sid, child_pid,
 			"child PID {child_pid} should be its own session leader after setsid",
 		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancellation_allows_background_term_cleanup_while_builtin_is_running() {
+		let _guard = shell_test_lock().lock().await;
+		let root = tempfile::tempdir().expect("cleanup directory");
+		let script = root.path().join("cleanup.sh");
+		fs::write(
+			&script,
+			"trap 'sleep 0.2; printf cleaned >> cleaned; exit 0' TERM\n: > ready\nwhile :; do :; \
+			 done\n",
+		)
+		.expect("cleanup script");
+		let shell = Shell::new(None);
+		let mut cancel = CancelToken::default();
+		let abort = cancel.emplace_abort_token();
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		let task = tokio::spawn(async move {
+			shell
+				.run(
+					ShellRunOptions {
+						command: "sh cleanup.sh & sleep 30".into(),
+						cwd: Some(cwd),
+						..Default::default()
+					},
+					None,
+					cancel,
+				)
+				.await
+		});
+		time::timeout(Duration::from_secs(5), async {
+			while !root.path().join("ready").exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("background child ready");
+		abort.abort(AbortReason::Signal);
+		let result = time::timeout(Duration::from_secs(5), task)
+			.await
+			.expect("cancel finished")
+			.expect("run task")
+			.expect("shell result");
+		assert!(result.cancelled);
+		assert_eq!(fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup"), "cleaned");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn termination_returns_early_after_the_child_exits() {
+		let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+		if cfg!(windows) {
+			command.args(["/c", "ping -n 30 127.0.0.1"]);
+		} else {
+			command.args(["-c", "exec sleep 30"]);
+		}
+		let mut child = command.kill_on_drop(true).spawn().expect("child");
+		let pid = i32::try_from(child.id().expect("child pid")).expect("pid fits");
+		let registry = process::SpawnRegistry::new();
+		registry.record(None, process::Process::from_pid(pid));
+		let started = time::Instant::now();
+		let ((), status) = tokio::join!(terminate_run(&registry), child.wait());
+		assert!(status.is_ok(), "terminated child must be reaped");
+		assert!(started.elapsed() < Duration::from_millis(750), "exited child consumed TERM grace");
 	}
 
 	/// Cancelling one `Shell::run` must only signal processes spawned by that

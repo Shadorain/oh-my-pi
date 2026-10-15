@@ -416,7 +416,7 @@ import {
 	SessionAdvisors,
 	type SessionAdvisorsHost,
 } from "./session-advisors";
-import type { BuildSessionContextOptions, SessionContext } from "./session-context";
+import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
 import { buildSessionContext, getRestorableSessionModels, isTranscriptEntry } from "./session-context";
 import type { CacheWarmer, CacheWarmingMode, CacheWarmingStatus } from "./cache-warmer";
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from "@oh-my-pi/pi-tui/chat/transcript-entry";
@@ -2151,6 +2151,7 @@ export class AgentSession implements SettingsScope {
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
 			obfuscator: () => this.#obfuscator,
+			runToolCallIds: () => this.#runToolCallIds,
 		};
 		this.#providerBoundary = new SessionProviderBoundary(providerBoundaryHost);
 		const streamGuardsHost: StreamGuardsHost = {
@@ -3404,6 +3405,12 @@ export class AgentSession implements SettingsScope {
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 	/**
+	 * Tool calls emitted by assistant turns of the current agent run. A mid-turn
+	 * transcript rebuild keeps only these unpaired calls live; calls left unpaired
+	 * by earlier runs (interrupted, host restarted) must not be revived as active.
+	 */
+	#runToolCallIds = new Set<string>();
+	/**
 	 * Terminal failure whose turn was pruned from history at settle: a classifier
 	 * refusal (#3591) or an abandoned length-stop recovery. Retained until the next
 	 * run starts so post-settle readers ({@link getLastAssistantMessage}: print
@@ -3866,6 +3873,7 @@ export class AgentSession implements SettingsScope {
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
 			this.#activeAgentPromptGeneration = eventPromptGeneration;
+			this.#runToolCallIds.clear();
 			this.#prunedTerminalFailure = undefined;
 			this.#advisors.onPrimaryAgentStart();
 			this.#emitRunState("running");
@@ -3895,6 +3903,9 @@ export class AgentSession implements SettingsScope {
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			for (const block of event.message.content) {
+				if (block.type === "toolCall") this.#runToolCallIds.add(block.id);
+			}
 			this.#cacheWarmer?.onResponse(event.message);
 			const deferred = this.#deferredTitle;
 			if (deferred && !deferred.replied) {
@@ -6564,7 +6575,7 @@ export class AgentSession implements SettingsScope {
 		return this.#maintenance.speculationState;
 	}
 	/** Strip image content from the current branch and persist the rewrite. */
-	dropImages(): Promise<{ removed: number }> {
+	dropImages(): Promise<{ removed: number; tokensFreed: number }> {
 		return this.#maintenance.dropImages();
 	}
 
@@ -6690,9 +6701,7 @@ export class AgentSession implements SettingsScope {
 	 * surface bounded. Display-only — NEVER feed the result to
 	 * `agent.replaceMessages` or a provider.
 	 */
-	buildTranscriptSessionContext(
-		options?: Pick<BuildSessionContextOptions, "collapseCompactedHistory" | "keepDanglingToolCalls">,
-	): SessionContext {
+	buildTranscriptSessionContext(options?: TranscriptSessionContextOptions): SessionContext {
 		return this.#providerBoundary.buildTranscriptSessionContext(options);
 	}
 

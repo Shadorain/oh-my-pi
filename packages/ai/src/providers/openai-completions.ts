@@ -140,6 +140,10 @@ type OpenAICompletionsChoiceUsage = ChatCompletionChunk.Choice & {
 	usage?: unknown;
 };
 
+type OpenAICompletionsRepetitionChoice = ChatCompletionChunk.Choice & {
+	stop_reason?: unknown;
+};
+
 type OpenAICompletionsDeltaWithReasoningDetails = ChatCompletionChunk.Choice["delta"] & {
 	reasoning_details?: unknown;
 };
@@ -235,19 +239,6 @@ function normalizeStoredGeminiSignature(value: unknown): StoredGeminiSignature |
 // Merges a new per-call or message-level signature into whatever is already
 // stored, so a later message-level signature never clobbers an earlier per-call
 // one (and vice versa).
-const DEMOTED_THINK_OPEN = "<think>\n";
-const DEMOTED_THINK_CLOSE = "\n</think>";
-
-/** Inner text of a block `transformMessages` marked with `kDemotedThinking`. */
-function unwrapDemotedThinking(text: string): string {
-	const wrapped =
-		text.startsWith(DEMOTED_THINK_OPEN) &&
-		text.endsWith(DEMOTED_THINK_CLOSE) &&
-		text.length > DEMOTED_THINK_OPEN.length + DEMOTED_THINK_CLOSE.length;
-	if (!wrapped) return text;
-	return text.slice(DEMOTED_THINK_OPEN.length, text.length - DEMOTED_THINK_CLOSE.length);
-}
-
 function mergeStoredGeminiSignature(existing: string | undefined, update: StoredGeminiSignature): string {
 	const merged = normalizeStoredGeminiSignature(parseStoredThoughtSignature(existing)) ?? {};
 	if (update.perCall !== undefined) merged.perCall = update.perCall;
@@ -1334,6 +1325,8 @@ const streamOpenAICompletionsOnce = (
 			let streamFinishedAt: number | undefined;
 			let sawUsagePayload = false;
 			let awaitTrailingUsageDetails = false;
+			/** Server-declared repetition stop; classified after the finalization sweep. */
+			let repetitionStop: string | undefined;
 			const applyUsagePayload = (rawUsage: object): void => {
 				output.usage = parseChunkUsage(
 					rawUsage,
@@ -1420,6 +1413,15 @@ const streamOpenAICompletionsOnce = (
 						applyUsagePayload(choiceUsage);
 					}
 				}
+
+				// A server-declared repetition stop completes the response, so it takes
+				// the same terminal bookkeeping a `finish_reason` chunk would. The
+				// classification itself is deferred to just before the error checks
+				// below: `output.content` is not final until the block sweep has run.
+				// Latched: a trailing frame without the signal must not clear the one
+				// an earlier chunk carried.
+				repetitionStop ??= detectRepetitionStop(choice);
+				if (repetitionStop) streamFinishedAt ??= Date.now();
 
 				if (choice.finish_reason) {
 					const finishReasonResult = mapStopReason(choice.finish_reason);
@@ -1775,6 +1777,27 @@ const streamOpenAICompletionsOnce = (
 
 			if (output.stopReason === "aborted") {
 				throw new AIError.AbortError();
+			}
+
+			// Checked before the generic `stopReason === "error"` throw so the flagged
+			// error is the one that reaches `AIError.finalize` — that call rebuilds
+			// `errorId` from the thrown error, so assigning the flag to `output` here
+			// would be overwritten. The partial output is dropped rather than
+			// committed or replayed into the retry; the guard's own loop error does
+			// the same, because degenerate reasoning is replay garbage (#12525).
+			if (repetitionStop) {
+				output.content = [];
+				// The sweep above already closed every block. Clear the handle so the
+				// catch's `finishOpenBlocksOnError` does not re-emit a `thinking_end`
+				// against an index that no longer exists in the emptied content array.
+				currentBlock = undefined;
+				throw AIError.attach(
+					new AIError.ProviderResponseError(`Provider reported a repetition stop: ${repetitionStop}`, {
+						provider: model.provider,
+						kind: "runtime",
+					}),
+					AIError.create(AIError.Flag.ThinkingLoop),
+				);
 			}
 			if (output.stopReason === "error") {
 				throw new AIError.ProviderResponseError(output.errorMessage || "Provider returned an error stop reason", {
@@ -2477,10 +2500,6 @@ export function convertMessages(
 			const textBlocks = msg.content.filter(b => b.type === "text") as TextContent[];
 			// Filter out empty text blocks to avoid API validation errors
 			const nonEmptyTextBlocks = textBlocks.filter(b => b.text && b.text.trim().length > 0);
-			const replayExactReasoning =
-				compat.requiresReasoningContentForToolCalls && !compat.allowsSyntheticReasoningContentForToolCalls;
-			const demotedReasoningParts: string[] = [];
-			let contentWithoutDemoted: string | undefined;
 			if (nonEmptyTextBlocks.length > 0) {
 				// Always send assistant content as a plain string. Some OpenAI-compatible
 				// backends mirror array-of-text-block payloads back to the model literally,
@@ -2499,22 +2518,6 @@ export function convertMessages(
 						return isDemotedThinking(b) && i < nonEmptyTextBlocks.length - 1 ? `${text}\n` : text;
 					})
 					.join("");
-				if (replayExactReasoning) {
-					const visible: string[] = [];
-					let breakBeforeNext = false;
-					for (const block of nonEmptyTextBlocks) {
-						const text = block.text.toWellFormed();
-						if (isDemotedThinking(block)) {
-							const inner = unwrapDemotedThinking(text);
-							if (inner.trim().length > 0) demotedReasoningParts.push(inner);
-							breakBeforeNext = visible.length > 0;
-							continue;
-						}
-						visible.push(breakBeforeNext ? `\n${text}` : text);
-						breakBeforeNext = false;
-					}
-					contentWithoutDemoted = visible.join("");
-				}
 			}
 
 			// Handle thinking blocks
@@ -2732,23 +2735,7 @@ export function convertMessages(
 					assistantMsg.reasoning_details = reasoningDetails;
 				}
 			}
-			// Cross-API history marks unsigned thinking with `kDemotedThinking` before
-			// this encoder flattens it into `content`, then the exact-replay fallback
-			// fills `reasoning_content` with "". DeepSeek thinking mode rejects that
-			// empty field. Move every marked block — not only a leading run, and not
-			// unmarked text that happens to look like `<think>` — into the structured
-			// field when that field is still empty.
-			if (
-				replayExactReasoning &&
-				demotedReasoningParts.length > 0 &&
-				(assistantMsg.reasoning_content === undefined || assistantMsg.reasoning_content === "")
-			) {
-				const reasoningField = compat.reasoningContentField ?? "reasoning_content";
-				assistantMsg[reasoningField] = demotedReasoningParts.join("\n");
-				assistantMsg.content =
-					contentWithoutDemoted && contentWithoutDemoted.length > 0 ? contentWithoutDemoted : null;
-				hasReasoningField = true;
-			}
+
 			// Some OpenAI-compatible backends concatenate assistant content as a
 			// string even for tool-call replay. OpenAI accepts an empty string here;
 			// null trips strict/proxy implementations before the tool result is read.
@@ -2946,6 +2933,36 @@ function convertTools(
 
 const EMPTY_OLLAMA_LENGTH_COMPLETION_MESSAGE =
 	"Model returned no content: prompt filled the context window; raise Ollama num_ctx or shorten the prompt.";
+
+/**
+ * Detect a server-declared repetition stop on a streamed choice.
+ *
+ * vLLM and other OpenAI-compatible servers report a generation that degenerated
+ * into repetition as a terminal signal rather than a content pattern OMP can
+ * see: `finish_reason: "repetition"`, and/or `stop_reason: "repetition_detected"`.
+ * The `stop_reason` form arrives alongside an ordinary `finish_reason: "stop"`,
+ * or with no `finish_reason` at all, so it has to be read independently of it —
+ * otherwise the signal is either masked by the clean finish or never seen.
+ *
+ * Returns the raw values for the diagnostic message, or `undefined` when the
+ * choice carries no repetition signal.
+ */
+function detectRepetitionStop(choice: ChatCompletionChunk.Choice): string | undefined {
+	const finishReason: string | null | undefined = choice.finish_reason;
+	const stopReason = (choice as OpenAICompletionsRepetitionChoice).stop_reason;
+	const namesRepetition = (value: string): boolean => {
+		const lower = value.toLowerCase();
+		return lower === "repetition" || lower === "repetition_detected";
+	};
+	const flagged =
+		(typeof finishReason === "string" && namesRepetition(finishReason)) ||
+		(typeof stopReason === "string" && namesRepetition(stopReason));
+	if (!flagged) return undefined;
+	const parts: string[] = [];
+	if (typeof finishReason === "string" && finishReason.length > 0) parts.push(`finish_reason=${finishReason}`);
+	if (typeof stopReason === "string" && stopReason.length > 0) parts.push(`stop_reason=${stopReason}`);
+	return parts.join(" ") || "repetition";
+}
 
 function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | string): {
 	stopReason: StopReason;

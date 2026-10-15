@@ -1848,7 +1848,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		});
 		const dropSpy = vi.spyOn(session, "dropImages").mockImplementation(async () => {
 			imagesDropped = true;
-			return { removed: 2 };
+			return { removed: 2, tokensFreed: 0 };
 		});
 
 		const notices = collectNotices();
