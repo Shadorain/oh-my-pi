@@ -253,7 +253,8 @@ interface SessionTitleRow {
 }
 
 interface SalvagedRecapRow extends SessionRecapRow {
-	id: number;
+	/** Decimal text, like history rowids: a number would round past 2^53 and break the rowid bind. */
+	id: string;
 }
 
 export interface SalvagedSessionIndex {
@@ -281,7 +282,7 @@ export function readSalvagedSessionIndex(source: Database): SalvagedSessionIndex
 		? readDamagedSqliteRows<SalvagedRecapRow>(
 				source,
 				"session_recaps",
-				"id, session_id, cwd, recap, created_at",
+				"CAST(id AS TEXT) AS id, session_id, cwd, recap, created_at",
 				"typeof(session_id) = 'text' AND typeof(cwd) = 'text' AND typeof(recap) = 'text' AND typeof(created_at) = 'integer'",
 			)
 		: { rows: [], damagedRegions: 0 };
@@ -298,7 +299,7 @@ WHERE excluded.updated_at > session_titles.updated_at
 	`);
 	const insertRecap = target.query(`
 INSERT INTO session_recaps (id, session_id, cwd, recap, created_at)
-VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5)
+VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = CAST(?1 AS INTEGER)) THEN NULL ELSE CAST(?1 AS INTEGER) END, ?2, ?3, ?4, ?5)
 	`);
 	for (const row of snapshot.titles) insertTitle.run(row.session_id, row.title, row.updated_at);
 	for (const row of snapshot.recaps) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);

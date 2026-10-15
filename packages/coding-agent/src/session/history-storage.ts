@@ -160,14 +160,9 @@ function compareRowIds(a: string, b: string): number {
 	return left < right ? -1 : left > right ? 1 : 0;
 }
 
-/** The file under `this.#db` was replaced between its open and now (a peer quarantined it); retry on the replacement. */
-class HistoryStoreReplaced extends Error {}
-
 /** Backup contents plus the ledger rows it carries; scanned without the store lease. */
 interface HistorySalvageScan {
 	backupName: string;
-	/** Quarantined file's identity; matching the live file marks the backup redundant. */
-	sourceIdentity?: string;
 	highWater: string | null;
 	history: SalvagedHistoryRow[];
 	index?: SalvagedSessionIndex;
@@ -220,6 +215,10 @@ CREATE TABLE IF NOT EXISTS history (
 	session_id TEXT,
 	use_count INTEGER NOT NULL DEFAULT 1
 );
+`;
+// Kept as its own statement: a multi-statement run reports only the last
+// error, which would hide a peer lock behind the index's "no such table".
+const HISTORY_INDEX_DDL = `
 CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
 `;
 
@@ -327,33 +326,56 @@ export class HistoryStorage {
 		// One-shot statements go through the query cache, which close() finalizes; a
 		// stray prepare() would turn close() into a zombie that keeps the files open.
 		const hadFts = this.#db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
-		this.#db.run(`
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-${HISTORY_TABLE_DDL}
-		`);
 
-		// Additive column on stores created before the counter existed; runs before
-		// the rebuild so the dump below always sees it.
-		this.#ensureColumn("use_count", "INTEGER NOT NULL DEFAULT 1");
-		const rebuilt = this.#rebuildHistory();
+		// The schema pass is idempotent, so a peer's write lock only defers it:
+		// the operation can still prepare against an already-initialized store.
+		let schemaDeferred = false;
+		try {
+			// One statement per run: bun:sqlite reports only the last error of a
+			// multi-statement exec, which would hide a peer's lock behind the
+			// follow-on CREATE INDEX's "no such table".
+			this.#db.run("PRAGMA journal_mode=WAL");
+			this.#db.run("PRAGMA synchronous=NORMAL");
+			this.#db.run(HISTORY_TABLE_DDL);
 
-		this.#db.run(`
-CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(prompt, content='history', content_rowid='id');
+			// Additive column on stores created before the counter existed; runs before
+			// the rebuild so the dump below always sees it.
+			this.#ensureColumn("use_count", "INTEGER NOT NULL DEFAULT 1");
+			const rebuilt = this.#rebuildHistory();
 
+			// After the rebuild, which drops the index along with the table.
+			this.#db.run(HISTORY_INDEX_DDL);
+			this.#db.run(
+				"CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(prompt, content='history', content_rowid='id')",
+			);
+			this.#db.run(`
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	INSERT INTO history_fts(rowid, prompt) VALUES (new.id, new.prompt);
 END;
 		`);
 
-		if (rebuilt || !hadFts) {
-			try {
-				this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
-			} catch (error) {
-				if (isSqliteCorruptionError(error)) throw error;
-				logger.warn("HistoryStorage FTS rebuild failed", { error: String(error) });
+			if (rebuilt || !hadFts) {
+				try {
+					this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
+				} catch (error) {
+					if (isSqliteCorruptionError(error)) throw error;
+					logger.warn("HistoryStorage FTS rebuild failed", { error: String(error) });
+				}
 			}
+		} catch (error) {
+			if (!isSqliteBusyError(error)) throw error;
+			schemaDeferred = true;
 		}
+		try {
+			this.#prepareStatements();
+		} catch (error) {
+			// A peer-created empty file has no schema to prepare against either;
+			// while its lock lasts the operation must defer, not prepare garbage.
+			if (!schemaDeferred) throw error;
+		}
+	}
+
+	#prepareStatements(): void {
 		this.#recentStmt = this.#db.query(
 			`SELECT ${liveRowColumns("")} FROM history WHERE ${wellFormedRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
 		);
@@ -396,86 +418,94 @@ ON CONFLICT(prompt) DO UPDATE SET
 	#withStore<T>(operation: () => T): T {
 		if (this.#closed) throw new Error("HistoryStorage is closed");
 		for (let attempt = 0; ; attempt++) {
-			// The recovery lease serializes who may replace the store file; a lease
-			// for initialization is enough — walking an immutable backup under it
-			// blocks every other participant's open for the duration of the scan.
-			const opened = withSqliteStoreLease(this.#dbPath, () => {
-				const db = openSqliteDatabaseSync(
-					this.#dbPath,
-					database => {
-						this.#initialize(database);
-						return database;
-					},
-					{
-						recoverCorruption: true,
-						onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath),
-					},
-				);
-				// Identity of the file this handle actually opened, after open()
-				// created it; pre-open stat reports `null` for a fresh store.
-				return { identity: sqliteFileIdentity(this.#dbPath), db };
-			});
+			// Backup scans never hold the lease or a live handle: they only read
+			// immutable quarantined files, and on Windows an open handle would
+			// defeat a peer's unlink of the corrupt store. The scan set is then
+			// drained under the lease against a freshly read journal, so entries
+			// a peer queued during the scans are scanned inline and applied.
+			const scanned = this.#scanPendingSalvage();
 			try {
-				const scans = this.#scanPendingSalvage(opened.identity);
 				return withSqliteStoreLease(this.#dbPath, () => {
-					const live = sqliteFileIdentity(this.#dbPath);
-					// A peer quarantined the store while backups were scanned: writes
-					// would land on an unlinked inode. Reopen against the replacement.
-					if (live !== undefined && live !== opened.identity) throw new HistoryStoreReplaced();
-					for (const scan of scans) {
-						try {
-							this.#applySalvageScan(scan);
-						} catch (error) {
-							// A peer holding the write lock defers the insert, same as a
-							// failed scan: the journal entry stays for the next open.
-							if (!isSqliteBusyError(error)) throw error;
-							logger.error("HistoryStorage salvage deferred", {
-								backupPath: scan.backupName,
-								error: String(error),
-							});
-							break;
+					const db = openSqliteDatabaseSync(
+						this.#dbPath,
+						database => {
+							this.#initialize(database);
+							return database;
+						},
+						{
+							recoverCorruption: true,
+							onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath),
+						},
+					);
+					try {
+						// The journal and the live identity are both read under the
+						// lease: a peer cannot publish a replacement whose entry a
+						// stale clear would erase, and a failed unlink's own snapshot
+						// is skipped as redundant.
+						const pending = readPendingSalvage(this.#dbPath);
+						if (pending.length > 0) {
+							const live = sqliteFileIdentity(this.#dbPath);
+							if (typeof live !== "string") throw new Error("Could not identify the history recovery target");
+							for (let i = pending.length - 1; i >= 0; i--) {
+								const record = pending[i];
+								if (record.sourceIdentity === live) {
+									clearPendingSalvage(this.#dbPath, record.backupName);
+									continue;
+								}
+								const backupPath = path.join(path.dirname(this.#dbPath), record.backupName);
+								const scan = scanned.has(record.backupName)
+									? scanned.get(record.backupName)
+									: this.#scanBackup(backupPath);
+								if (!scan) break;
+								try {
+									this.#applySalvageScan(scan);
+								} catch (error) {
+									// A peer holding the write lock defers the insert, same as a
+									// failed scan: the journal entry stays for the next open.
+									if (!isSqliteBusyError(error)) throw error;
+									logger.error("HistoryStorage salvage deferred", {
+										backupPath: scan.backupName,
+										error: String(error),
+									});
+									break;
+								}
+							}
 						}
+						return operation();
+					} finally {
+						this.#substringStmts.clear();
+						db.close();
 					}
-					return operation();
 				});
 			} catch (error) {
 				// The open-time check is generation-gated, so damage done after
 				// that scan first surfaces as an operation error. Invalidate the
 				// generation proof and retry once: the re-scan recovers a corrupt
 				// store through the same path an open-time failure does.
-				if (attempt > 0 || (!isSqliteCorruptionError(error) && !(error instanceof HistoryStoreReplaced)))
-					throw error;
+				if (attempt > 0 || !isSqliteCorruptionError(error)) throw error;
 				this.#checkedIdentity = undefined;
-			} finally {
-				this.#substringStmts.clear();
-				opened.db.close();
 			}
 		}
 	}
 
 	/**
-	 * Reads the pending-salvage journal and snapshots each recoverable backup,
-	 * newest first, until one defers. No lease and no live-database access: the
+	 * Snapshots every recoverable journaled backup, newest first, stopping at
+	 * the first deferral. Runs without the lease and without a live handle:
 	 * scans hold only read handles on immutable quarantined files, so a large
-	 * damaged backup cannot serialize the store's other participants.
+	 * damaged backup cannot serialize the store's other participants, and no
+	 * connection of ours can block a peer's quarantine unlink on Windows.
+	 * `undefined` map entries mark backups that were read and deferred.
 	 */
-	#scanPendingSalvage(identity: SqliteFileIdentity): HistorySalvageScan[] {
+	#scanPendingSalvage(): Map<string, HistorySalvageScan | undefined> {
 		const pending = readPendingSalvage(this.#dbPath);
-		if (pending.length === 0) return [];
-		if (typeof identity !== "string") throw new Error("Could not identify the history recovery target");
-		const scans: HistorySalvageScan[] = [];
+		const scans = new Map<string, HistorySalvageScan | undefined>();
 		// A newer snapshot carries the ledger of older committed backups.
 		// Do not replay older entries until that ledger has been restored.
 		for (let i = pending.length - 1; i >= 0; i--) {
-			// A failed unlink can leave the source live in an already-open peer.
-			// Its snapshot is redundant, not another submission.
-			if (pending[i].sourceIdentity === identity) {
-				clearPendingSalvage(this.#dbPath, pending[i].backupName);
-				continue;
-			}
-			const scan = this.#scanBackup(path.join(path.dirname(this.#dbPath), pending[i].backupName));
+			const backupPath = path.join(path.dirname(this.#dbPath), pending[i].backupName);
+			const scan = this.#scanBackup(backupPath);
+			scans.set(pending[i].backupName, scan);
 			if (!scan) break;
-			scans.push(scan);
 		}
 		return scans;
 	}
