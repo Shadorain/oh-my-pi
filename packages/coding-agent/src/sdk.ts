@@ -3195,28 +3195,48 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const tryResolveDefaultRoleFallback = (fallbackCandidates: Model[]): boolean => {
 				const originalSelector = settings.getModelRole("default");
 				if (hasExplicitModel || !originalSelector || !cfgRetryModelFallback.get(settings)) return false;
+				const chains = expandDefaultRetryFallbackChains(cfgRetryFallbackChains.get(settings), [
+					...Object.keys(settings.getModelRoles()),
+					"default",
+				]);
+				// Candidates come only from configured chain entries. Without one,
+				// bail before any catalog lookup so the first-paint path never
+				// composes the full catalog.
+				if (!Object.values(chains).some(chain => Array.isArray(chain) && chain.length > 0)) return false;
 				const fallbackContext: RetryFallbackResolutionContext = {
-					chains: expandDefaultRetryFallbackChains(cfgRetryFallbackChains.get(settings), [
-						...Object.keys(settings.getModelRoles()),
-						"default",
-					]),
+					chains,
 					getModelRole: role => settings.getModelRole(role),
 					modelLookup: modelRegistry,
 				};
-				const allModels = modelRegistry.getAll();
-				const originalModel = parseModelPattern(originalSelector, allModels, modelMatchPreferences).model;
-				const chainKey = resolveRetryFallbackChainKey(fallbackContext, originalSelector, originalModel, "default");
-				if (!chainKey) return false;
 				const parsedOriginal = parseModelString(originalSelector, {
 					allowMaxSuffix: true,
 					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
+				// A provider-qualified selector resolves within its provider's
+				// catalog; only bare/alias selectors need the full catalog.
+				const originalModel = parsedOriginal
+					? (modelRegistry.find(parsedOriginal.provider, parsedOriginal.id) ??
+						parseModelPattern(
+							originalSelector,
+							modelRegistry.getProviderModels(parsedOriginal.provider),
+							modelMatchPreferences,
+						).model)
+					: parseModelPattern(originalSelector, modelRegistry.getAll(), modelMatchPreferences).model;
+				const chainKey = resolveRetryFallbackChainKey(fallbackContext, originalSelector, originalModel, "default");
+				if (!chainKey) return false;
 				const retryFallback: InitialRetryFallbackState = {
 					role: chainKey,
 					originalSelector,
 					originalThinkingLevel: parsedOriginal?.thinkingLevel,
 				};
+				// `fallbackCandidates` is the default-availability pool, which ignores
+				// cross-provider env aliases (`xai-oauth` borrowing `XAI_API_KEY`).
+				// An explicit chain entry is bound only by the `enabledModels` scope,
+				// so outside one it resolves from its provider's catalog and
+				// `hasModelAuth` decides whether requests can authenticate.
+				const scopedByEnabledModels = (cfgEnabledModels.get(settings)?.length ?? 0) > 0;
+				const disabledProviders = cfgDisabledProviders.get(settings);
 				for (const candidate of findRetryFallbackCandidates(
 					fallbackContext,
 					chainKey,
@@ -3224,7 +3244,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					originalModel,
 					{ allowMissingPrimary: true },
 				)) {
-					const resolved = parseModelPattern(candidate.raw, fallbackCandidates, modelMatchPreferences);
+					let resolved = parseModelPattern(candidate.raw, fallbackCandidates, modelMatchPreferences);
+					if (!resolved.model && !scopedByEnabledModels && !disabledProviders?.includes(candidate.provider)) {
+						resolved = parseModelPattern(
+							candidate.raw,
+							modelRegistry.getProviderModels(candidate.provider),
+							modelMatchPreferences,
+						);
+					}
 					if (!resolved.model || !hasModelAuth(resolved.model)) continue;
 					model = resolved.model;
 					initialRetryFallback = retryFallback;
