@@ -26,6 +26,7 @@ import { getHistoryDbPath, resolveEquivalentPath } from "@oh-my-pi/pi-utils/dirs
 import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import {
+	isSqliteBusyError,
 	onSqliteStoreQuarantine,
 	readDamagedSqliteRows,
 	sqliteFileIdentity,
@@ -105,6 +106,7 @@ ON CONFLICT(session_id) DO UPDATE SET
 				} catch {}
 			}
 			db?.close();
+			if (isSqliteBusyError(error)) return undefined;
 			failedPath = dbPath;
 			failedIdentity = sqliteFileIdentity(dbPath);
 			if (failedPathUnregister) failedPathUnregister();

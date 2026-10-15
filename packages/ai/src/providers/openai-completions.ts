@@ -34,7 +34,7 @@ import type {
 	ToolChoice,
 	ToolResultMessage,
 } from "../types";
-import { normalizeSystemPrompts, resolveCacheRetention } from "../utils";
+import { normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { isDemotedThinking, kStreamingLastParseLen } from "../utils/block-symbols";
 import { hasVisibleAssistantContent, withReplaySafeStreamRetry } from "../utils/empty-completion-retry";
@@ -111,6 +111,7 @@ import {
 	type OpenAIRequestSetup,
 	type OpenAIStrictToolsState,
 	parseAzureDeploymentNameMap,
+	readOpenRouterRawMetadata,
 	resolveOpenAICompatPolicy,
 	resolveOpenAICompletionsOutputClamp,
 	resolveOpenAIOutputTokenParam,
@@ -126,6 +127,8 @@ import {
 } from "./vision-guard";
 
 export { applyOpenRouterRoutingVariant } from "./openai-shared";
+
+const OPENAI_TOOL_CALL_ID_MAX_LENGTH = 40;
 
 type OpenAICompletionsReasoningField = NonNullable<ResolvedOpenAICompat["reasoningContentField"]>;
 
@@ -232,6 +235,19 @@ function normalizeStoredGeminiSignature(value: unknown): StoredGeminiSignature |
 // Merges a new per-call or message-level signature into whatever is already
 // stored, so a later message-level signature never clobbers an earlier per-call
 // one (and vice versa).
+const DEMOTED_THINK_OPEN = "<think>\n";
+const DEMOTED_THINK_CLOSE = "\n</think>";
+
+/** Inner text of a block `transformMessages` marked with `kDemotedThinking`. */
+function unwrapDemotedThinking(text: string): string {
+	const wrapped =
+		text.startsWith(DEMOTED_THINK_OPEN) &&
+		text.endsWith(DEMOTED_THINK_CLOSE) &&
+		text.length > DEMOTED_THINK_OPEN.length + DEMOTED_THINK_CLOSE.length;
+	if (!wrapped) return text;
+	return text.slice(DEMOTED_THINK_OPEN.length, text.length - DEMOTED_THINK_CLOSE.length);
+}
+
 function mergeStoredGeminiSignature(existing: string | undefined, update: StoredGeminiSignature): string {
 	const merged = normalizeStoredGeminiSignature(parseStoredThoughtSignature(existing)) ?? {};
 	if (update.perCall !== undefined) merged.perCall = update.perCall;
@@ -1792,7 +1808,7 @@ const streamOpenAICompletionsOnce = (
 			output.errorId = result.id;
 			output.errorMessage = result.message;
 			// Some providers via OpenRouter include extra details here.
-			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
+			const rawMetadata = readOpenRouterRawMetadata(capturedErrorResponse);
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -2305,10 +2321,10 @@ export function convertMessages(
 	const maxNormalizedToolCallIdLength = compat.requiresMistralToolIds
 		? 9
 		: compat.usesOpenAIToolCallIdLimit
-			? 40
+			? OPENAI_TOOL_CALL_ID_MAX_LENGTH
 			: undefined;
 	const duplicateToolCallIdSuffixPrefix = compat.requiresMistralToolIds ? "dup" : undefined;
-	const normalizeToolCallId = (id: string, source?: AssistantMessage): string => {
+	const normalizeCompletionsToolCallId = (id: string, source?: AssistantMessage): string => {
 		if (compat.requiresMistralToolIds) return normalizeMistralToolId(id, true);
 
 		const isSameModelSource =
@@ -2321,16 +2337,17 @@ export function convertMessages(
 		// Chat Completions IDs are provider-issued opaque correlation tokens.
 		if (!isSameModelSource && id.includes("|")) {
 			const [callId] = id.split("|");
-			return callId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
+			return normalizeToolCallId(callId, OPENAI_TOOL_CALL_ID_MAX_LENGTH);
 		}
 
-		if (compat.usesOpenAIToolCallIdLimit) return id.length > 40 ? id.slice(0, 40) : id;
+		if (compat.usesOpenAIToolCallIdLimit)
+			return id.length > OPENAI_TOOL_CALL_ID_MAX_LENGTH ? id.slice(0, OPENAI_TOOL_CALL_ID_MAX_LENGTH) : id;
 		return id;
 	};
 	const transformedMessages = transformMessages(
 		context.messages,
 		model,
-		(id, _target, source) => normalizeToolCallId(id, source),
+		(id, _target, source) => normalizeCompletionsToolCallId(id, source),
 		maxNormalizedToolCallIdLength,
 		duplicateToolCallIdSuffixPrefix,
 		compat,
@@ -2363,7 +2380,7 @@ export function convertMessages(
 	};
 
 	const ensureToolCallId = (rawId: string, seed: string, source?: AssistantMessage): string => {
-		const normalized = normalizeToolCallId(rawId, source);
+		const normalized = normalizeCompletionsToolCallId(rawId, source);
 		if (normalized.trim().length > 0) return normalized;
 		return generateFallbackToolCallId(seed);
 	};
@@ -2460,6 +2477,10 @@ export function convertMessages(
 			const textBlocks = msg.content.filter(b => b.type === "text") as TextContent[];
 			// Filter out empty text blocks to avoid API validation errors
 			const nonEmptyTextBlocks = textBlocks.filter(b => b.text && b.text.trim().length > 0);
+			const replayExactReasoning =
+				compat.requiresReasoningContentForToolCalls && !compat.allowsSyntheticReasoningContentForToolCalls;
+			const demotedReasoningParts: string[] = [];
+			let contentWithoutDemoted: string | undefined;
 			if (nonEmptyTextBlocks.length > 0) {
 				// Always send assistant content as a plain string. Some OpenAI-compatible
 				// backends mirror array-of-text-block payloads back to the model literally,
@@ -2478,6 +2499,22 @@ export function convertMessages(
 						return isDemotedThinking(b) && i < nonEmptyTextBlocks.length - 1 ? `${text}\n` : text;
 					})
 					.join("");
+				if (replayExactReasoning) {
+					const visible: string[] = [];
+					let breakBeforeNext = false;
+					for (const block of nonEmptyTextBlocks) {
+						const text = block.text.toWellFormed();
+						if (isDemotedThinking(block)) {
+							const inner = unwrapDemotedThinking(text);
+							if (inner.trim().length > 0) demotedReasoningParts.push(inner);
+							breakBeforeNext = visible.length > 0;
+							continue;
+						}
+						visible.push(breakBeforeNext ? `\n${text}` : text);
+						breakBeforeNext = false;
+					}
+					contentWithoutDemoted = visible.join("");
+				}
 			}
 
 			// Handle thinking blocks
@@ -2694,6 +2731,22 @@ export function convertMessages(
 				if (reasoningDetails.length > 0) {
 					assistantMsg.reasoning_details = reasoningDetails;
 				}
+			}
+			// Cross-API history marks unsigned thinking with `kDemotedThinking` before
+			// this encoder flattens it into `content`, then the exact-replay fallback
+			// fills `reasoning_content` with "". DeepSeek thinking mode rejects that
+			// empty field. Move every marked block — not only a leading run, and not
+			// unmarked text that happens to look like `<think>` — into the structured
+			// field when that field is still empty.
+			if (
+				replayExactReasoning &&
+				demotedReasoningParts.length > 0 &&
+				(assistantMsg.reasoning_content === undefined || assistantMsg.reasoning_content === "")
+			) {
+				const reasoningField = compat.reasoningContentField ?? "reasoning_content";
+				assistantMsg[reasoningField] = demotedReasoningParts.join("\n");
+				assistantMsg.content = contentWithoutDemoted && contentWithoutDemoted.length > 0 ? contentWithoutDemoted : null;
+				hasReasoningField = true;
 			}
 			// Some OpenAI-compatible backends concatenate assistant content as a
 			// string even for tool-call replay. OpenAI accepts an empty string here;
