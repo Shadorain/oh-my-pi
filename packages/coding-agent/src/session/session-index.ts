@@ -25,7 +25,12 @@ import * as path from "node:path";
 import { getHistoryDbPath } from "@oh-my-pi/pi-utils/dirs";
 import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
-import { onSqliteStoreQuarantine, readDamagedSqliteRows, withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
+import {
+	onSqliteStoreQuarantine,
+	readDamagedSqliteRows,
+	sqliteFileIdentity,
+	withSqliteStoreLease,
+} from "@oh-my-pi/pi-utils/sqlite";
 
 const SESSION_INDEX_DDL = `
 CREATE TABLE IF NOT EXISTS session_titles (
@@ -56,21 +61,11 @@ let failedIdentity: string | null | undefined;
 /** One quarantine-clearing hook per {@link failedPath}; self-unregisters once it fires. */
 let failedPathUnregister: (() => void) | undefined;
 
-function sessionIndexFileIdentity(dbPath: string): string | null | undefined {
-	try {
-		const stat = fs.statSync(dbPath);
-		return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
-	} catch (error) {
-		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return null;
-		return undefined;
-	}
-}
-
 function withSessionIndex<T>(operation: (index: SessionIndexHandle) => T): T | undefined {
 	const dbPath = getHistoryDbPath();
 	return withSqliteStoreLease(dbPath, () => {
 		if (failedPath === dbPath) {
-			const currentIdentity = sessionIndexFileIdentity(dbPath);
+			const currentIdentity = sqliteFileIdentity(dbPath);
 			if (currentIdentity === undefined || currentIdentity === failedIdentity) return undefined;
 			failedPath = undefined;
 			failedIdentity = undefined;
@@ -111,7 +106,7 @@ ON CONFLICT(session_id) DO UPDATE SET
 			}
 			db?.close();
 			failedPath = dbPath;
-			failedIdentity = sessionIndexFileIdentity(dbPath);
+			failedIdentity = sqliteFileIdentity(dbPath);
 			if (failedPathUnregister) failedPathUnregister();
 			const hook = onSqliteStoreQuarantine(dbPath, () => {
 				if (failedPath === dbPath) {

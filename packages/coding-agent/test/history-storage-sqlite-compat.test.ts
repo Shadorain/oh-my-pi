@@ -633,3 +633,85 @@ HistoryStorage.close();
 		await output.return(undefined);
 	}
 }, 15_000);
+
+it.each([
+	{ mode: "rebuild", empty: false },
+	{ mode: "rebuild", empty: true },
+	{ mode: "recovery", empty: false },
+	{ mode: "recovery", empty: true },
+])("preserves prediction cursors across $mode with empty=$empty", async ({ mode, empty }) => {
+	tempDir = TempDir.createSync("@omp-history-sequence-cursor-");
+	const dbPath = tempDir.join("history.db");
+	await HistoryStorage.open(dbPath).add("survivor");
+	HistoryStorage.close();
+	const raw = new Database(dbPath);
+	raw.run("INSERT INTO history (id, prompt) VALUES (1000, 'removed newest')");
+	raw.run(empty ? "DELETE FROM history" : "DELETE FROM history WHERE id = 1000");
+	raw.run(`PRAGMA user_version = ${mode === "rebuild" ? 1 : 2}`);
+	raw.run("PRAGMA journal_mode=DELETE");
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const indexRoot = raw
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name='idx_history_created_at'")
+		.get()!.rootpage;
+	raw.close();
+	if (mode === "recovery") {
+		const fd = fs.openSync(dbPath, "r+");
+		try {
+			fs.writeSync(fd, Buffer.alloc(pageSize, 255), 0, pageSize, (indexRoot - 1) * pageSize);
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("new unlearned prompt");
+	const consumer = new Database(dbPath, { readonly: true });
+	try {
+		// The predictor has persisted cursor=1000 even though GC deleted that row.
+		expect(consumer.query("SELECT prompt FROM history WHERE id > ? ORDER BY id").all(1000)).toEqual([
+			{ prompt: "new unlearned prompt" },
+		]);
+	} finally {
+		consumer.close();
+	}
+});
+
+it("checks integrity once per store generation while keeping indexed history operations scan-free", async () => {
+	tempDir = TempDir.createSync("@omp-history-integrity-generation-");
+	const dbPath = tempDir.join("history.db");
+	const check = vi.spyOn(utils, "assertSqliteQuickCheck");
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("kept prompt");
+	for (let i = 0; i < 3; i++) {
+		expect(storage.getRecent(1).map(row => row.prompt)).toEqual(["kept prompt"]);
+		expect(storage.search("kept", 1).map(row => row.prompt)).toEqual(["kept prompt"]);
+	}
+	expect(check.mock.calls.length).toBe(1);
+	// The facade remains open while another process replaces the file.
+	const replacementPath = tempDir.join("replacement.db");
+	fs.copyFileSync(dbPath, replacementPath);
+	fs.renameSync(replacementPath, dbPath);
+	expect(storage.search("kept", 1).map(row => row.prompt)).toEqual(["kept prompt"]);
+	expect(check.mock.calls.length).toBe(2);
+});
+
+it("recovers operation-level corruption without rescanning a healthy generation on each lookup", async () => {
+	tempDir = TempDir.createSync("@omp-history-operation-corruption-");
+	const dbPath = tempDir.join("history.db");
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("still readable");
+	const raw = new Database(dbPath);
+	raw.run("PRAGMA journal_mode=DELETE");
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const root = raw
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name='idx_history_created_at'")
+		.get()!.rootpage;
+	raw.close();
+	const fd = fs.openSync(dbPath, "r+");
+	try {
+		fs.writeSync(fd, Buffer.alloc(pageSize, 255), 0, pageSize, (root - 1) * pageSize);
+	} finally {
+		fs.closeSync(fd);
+	}
+	expect(storage.getRecent(10).map(row => row.prompt)).toEqual(["still readable"]);
+	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
+});

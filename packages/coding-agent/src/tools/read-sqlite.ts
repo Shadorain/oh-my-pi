@@ -1,3 +1,6 @@
+import { getHistoryDbPath } from "@oh-my-pi/pi-utils/dirs";
+import * as path from "node:path";
+import { withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
 import type { Database } from "bun:sqlite";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "../sdk";
@@ -21,6 +24,7 @@ import {
 	listTables,
 	MAX_RAW_QUERY_ROWS,
 	openSqliteReadConnection,
+	openSqliteReadConnectionSync,
 	parseSqlitePathCandidates,
 	parseSqliteSelector,
 	queryRows,
@@ -108,11 +112,8 @@ export async function readSqlite(
 		suffixResolution: resolvedSqlitePath.suffixResolution,
 	};
 
-	let db: Database | null = null;
-	try {
-		db = await openSqliteReadConnection(resolvedSqlitePath.absolutePath);
+	const renderResult = (db: Database): AgentToolResult<ReadToolDetails> => {
 		throwIfAborted(signal);
-
 		switch (selector.kind) {
 			case "list": {
 				const listLimit = applyListLimit(listTables(db), { limit: 500 });
@@ -204,14 +205,34 @@ export async function readSqlite(
 					.done();
 			}
 		}
-
 		throw new ToolError("Unsupported SQLite selector");
+	};
+
+	try {
+		// Reads of the process-wide store must not hold a handle across an await
+		// while corruption recovery quarantines and replaces it: open synchronously
+		// inside the shared lease. Other databases keep the async opener (their WAL
+		// sidecar probe requires it) and the same close-before-return lifetime.
+		if (path.resolve(resolvedSqlitePath.absolutePath) === path.resolve(getHistoryDbPath())) {
+			return withSqliteStoreLease(resolvedSqlitePath.absolutePath, () => {
+				const db = openSqliteReadConnectionSync(resolvedSqlitePath.absolutePath);
+				try {
+					return renderResult(db);
+				} finally {
+					db.close();
+				}
+			});
+		}
+		const db = await openSqliteReadConnection(resolvedSqlitePath.absolutePath);
+		try {
+			return renderResult(db);
+		} finally {
+			db.close();
+		}
 	} catch (error) {
 		if (error instanceof ToolError) {
 			throw error;
 		}
 		throw new ToolError(error instanceof Error ? error.message : String(error));
-	} finally {
-		db?.close();
 	}
 }

@@ -12,11 +12,11 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Database } from "bun:sqlite";
 import { type PredictedWord, TextPredictor } from "@oh-my-pi/pi-natives";
 import { getHistoryDbPath, getPredictStateDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
 import { JsonLineServer } from "../subprocess/jsonl-server";
-import { openSqliteReadConnection } from "../tools/sqlite-reader";
+import { openSqliteReadConnectionSync } from "../tools/sqlite-reader";
 import { blendPredictions } from "./blend";
 import { readForeignPrompts } from "./foreign-history";
 import {
@@ -115,7 +115,7 @@ export class PersistCadence {
 }
 
 /** One open engine plus the history position its persisted state covers. */
-class Engine {
+export class Engine {
 	/** Highest `history.id` fed to `observe`. */
 	cursor: number;
 	/** Foreign prompt histories still owed to empty state (see {@link readForeignPrompts}). */
@@ -181,28 +181,31 @@ class Engine {
 			if (prompts.length > 0) this.markDirty();
 			ingested += prompts.length;
 		}
-		let db: Database;
-		try {
-			db = await openSqliteReadConnection(historyDbPath);
-		} catch (error) {
-			// No history yet (fresh install) is not an error.
-			if (!isEnoent(error)) logger.debug("text-predict: history unavailable", { error: String(error) });
-			return ingested;
-		}
-		try {
-			const page = db.query<{ id: number; prompt: string }, [number, number]>(
-				"SELECT id, prompt FROM history WHERE id > ? ORDER BY id LIMIT ?",
-			);
-			for (;;) {
-				const rows = page.all(this.cursor, INGEST_BATCH);
-				if (rows.length === 0) break;
-				await this.predictor.observe(rows.map(row => row.prompt));
-				this.cursor = rows.at(-1)?.id ?? this.cursor;
-				ingested += rows.length;
-				if (rows.length < INGEST_BATCH) break;
+		for (;;) {
+			let rows: Array<{ id: number; prompt: string }>;
+			try {
+				rows = withSqliteStoreLease(historyDbPath, () => {
+					const db = openSqliteReadConnectionSync(historyDbPath);
+					try {
+						return db
+							.query<{ id: number; prompt: string }, [number, number]>(
+								"SELECT id, prompt FROM history WHERE id > ? AND typeof(prompt) = 'text' ORDER BY id LIMIT ?",
+							)
+							.all(this.cursor, INGEST_BATCH);
+					} finally {
+						db.close();
+					}
+				});
+			} catch (error) {
+				// No history yet (fresh install) is not an error.
+				if (!isEnoent(error)) logger.debug("text-predict: history unavailable", { error: String(error) });
+				return ingested;
 			}
-		} finally {
-			db.close();
+			if (rows.length === 0) break;
+			await this.predictor.observe(rows.map(row => row.prompt));
+			this.cursor = rows.at(-1)?.id ?? this.cursor;
+			ingested += rows.length;
+			if (rows.length < INGEST_BATCH) break;
 		}
 		return ingested;
 	}

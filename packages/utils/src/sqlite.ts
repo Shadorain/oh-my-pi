@@ -147,7 +147,8 @@ class SqliteAttemptFailure extends Error {
 	}
 }
 
-function sqliteFileIdentity(dbPath: string): SqliteFileIdentity {
+/** Generation key of the store file (`dev:ino:birthtime`); `null` while absent, `undefined` on stat failure. */
+export function sqliteFileIdentity(dbPath: string): SqliteFileIdentity {
 	try {
 		const stat = fs.statSync(dbPath);
 		return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;

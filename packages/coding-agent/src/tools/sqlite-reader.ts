@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { formatBytes, replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -26,6 +27,18 @@ async function requiresWalSidecarInitialization(filePath: string): Promise<boole
 		Bun.file(`${filePath}-shm`).exists(),
 	]);
 	return !walExists || !shmExists;
+}
+
+function requiresWalSidecarInitializationSync(filePath: string): boolean {
+	const fd = fs.openSync(filePath, "r");
+	const formatVersions = new Uint8Array(2);
+	try {
+		fs.readSync(fd, formatVersions, 0, formatVersions.byteLength, 18);
+	} finally {
+		fs.closeSync(fd);
+	}
+	if (formatVersions[0] !== 2 && formatVersions[1] !== 2) return false;
+	return !fs.existsSync(`${filePath}-wal`) || !fs.existsSync(`${filePath}-shm`);
 }
 
 function configureSqliteReadConnection(db: Database): Database {
@@ -57,6 +70,19 @@ export async function openSqliteReadConnection(filePath: string): Promise<Databa
 		if (!isSqliteCantOpen(error)) {
 			throw error;
 		}
+	}
+	return configureSqliteReadConnection(new Database(filePath, { readwrite: true, create: false, strict: true }));
+}
+
+/** Synchronous counterpart for callers that must scope the full read under a synchronous store lease. */
+export function openSqliteReadConnectionSync(filePath: string): Database {
+	if (requiresWalSidecarInitializationSync(filePath)) {
+		return configureSqliteReadConnection(new Database(filePath, { readwrite: true, create: false, strict: true }));
+	}
+	try {
+		return configureSqliteReadConnection(new Database(filePath, { readonly: true, strict: true }));
+	} catch (error) {
+		if (!isSqliteCantOpen(error)) throw error;
 	}
 	return configureSqliteReadConnection(new Database(filePath, { readwrite: true, create: false, strict: true }));
 }

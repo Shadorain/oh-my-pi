@@ -9,6 +9,7 @@ import {
 	logger,
 	openSqliteDatabaseSync,
 	readDamagedSqliteRows,
+	sqliteFileIdentity,
 	withSqliteStoreLease,
 } from "@oh-my-pi/pi-utils";
 import { writeFileAtomicallySync } from "../utils/atomic-file";
@@ -122,6 +123,38 @@ function historyRowColumns(db: Database): string {
 }
 
 /**
+ * Reads `history`'s AUTOINCREMENT high-water mark. `null` when the store
+ * predates AUTOINCREMENT or the sequence row itself is unreachable — losing the
+ * mark degrades to pre-fix behavior, so a damaged `sqlite_sequence` never
+ * blocks salvage.
+ */
+function readHistorySequence(db: Database): number | null {
+	if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'").get()) return null;
+	try {
+		const row = db.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name = 'history'").get();
+		return typeof row?.seq === "number" ? row.seq : null;
+	} catch (error) {
+		logger.warn("HistoryStorage could not read the history sequence", { error: String(error) });
+		return null;
+	}
+}
+
+/**
+ * Raises `history`'s sequence to `seq` without lowering it — row-preserving
+ * inserts already advanced it to the largest surviving id. Predictor cursors
+ * persist `WHERE id > ?` checkpoints across process restarts, so a rebuild or
+ * recovery that resets the sequence makes fresh prompts land under the cursor
+ * and skip learning until ids catch up.
+ */
+function restoreHistorySequence(db: Database, seq: number | null): void {
+	if (seq === null) return;
+	db.query("UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = 'history'").run(seq);
+	db.query(
+		"INSERT INTO sqlite_sequence (name, seq) SELECT 'history', ? WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'history')",
+	).run(seq);
+}
+
+/**
  * Bumped only when stored rows need the one-time dump-and-rebuild pass on open;
  * see `#rebuildHistory`. Purely additive columns go through `#ensureColumn`
  * instead so existing stores are never rewritten for them.
@@ -221,7 +254,9 @@ export class HistoryStorage {
 	#errorListener?: (error: unknown) => void;
 	#writeFailureReported = false;
 	#closed = false;
-
+	// File generation whose integrity this process already proved; `undefined`
+	// forces a scan, `null` (missing file) and real identities are checkable.
+	#checkedIdentity: string | null | undefined;
 	// Prepared statements
 	#upsertRowStmt!: Statement;
 	#recentStmt!: Statement;
@@ -307,24 +342,33 @@ ON CONFLICT(prompt) DO UPDATE SET
 	#withStore<T>(operation: () => T): T {
 		if (this.#closed) throw new Error("HistoryStorage is closed");
 		return withSqliteStoreLease(this.#dbPath, () => {
-			const db = openSqliteDatabaseSync(
-				this.#dbPath,
-				database => {
-					this.#initialize(database);
-					const pending = readPendingSalvage(this.#dbPath);
-					if (pending) this.#salvageFrom(pending.backupPath);
-					return database;
-				},
-				{
-					recoverCorruption: true,
-					onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath, true),
-				},
-			);
-			try {
-				return operation();
-			} finally {
-				this.#substringStmts.clear();
-				db.close();
+			for (let attempt = 0; ; attempt++) {
+				const db = openSqliteDatabaseSync(
+					this.#dbPath,
+					database => {
+						this.#initialize(database);
+						const pending = readPendingSalvage(this.#dbPath);
+						if (pending) this.#salvageFrom(pending.backupPath);
+						return database;
+					},
+					{
+						recoverCorruption: true,
+						onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath, true),
+					},
+				);
+				try {
+					return operation();
+				} catch (error) {
+					// The open-time check is generation-gated, so damage done after
+					// that scan first surfaces as an operation error. Invalidate the
+					// generation proof and retry once: the re-scan recovers a corrupt
+					// store through the same path an open-time failure does.
+					if (attempt > 0 || !isSqliteCorruptionError(error)) throw error;
+					this.#checkedIdentity = undefined;
+				} finally {
+					this.#substringStmts.clear();
+					db.close();
+				}
 			}
 		});
 	}
@@ -513,7 +557,13 @@ ON CONFLICT(prompt) DO UPDATE SET
 	#rebuildHistory(): boolean {
 		const readVersion = () => this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
 		if (readVersion() >= HISTORY_DATA_VERSION) {
+			// A full-store scan is O(pages); gate it to file generations this
+			// process hasn't proven — the generation changes exactly when a peer
+			// or this process replaces the file.
+			const identity = sqliteFileIdentity(this.#dbPath);
+			if (identity !== undefined && identity === this.#checkedIdentity) return false;
 			assertSqliteQuickCheck(this.#db);
+			if (identity !== undefined) this.#checkedIdentity = identity;
 			return false;
 		}
 		let rebuilt = false;
@@ -521,6 +571,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			.transaction(() => {
 				if (readVersion() >= HISTORY_DATA_VERSION) return;
 				assertSqliteQuickCheck(this.#db);
+				const highWater = readHistorySequence(this.#db);
 				let rows: HistoryRow[];
 				try {
 					rows = this.#db
@@ -538,6 +589,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 				this.#db.run("DROP TABLE history");
 				this.#db.run(HISTORY_TABLE_DDL);
 				this.#insertRows(winners);
+				restoreHistorySequence(this.#db, highWater);
 				this.#db.run(`PRAGMA user_version = ${HISTORY_DATA_VERSION}`);
 				rebuilt = true;
 				if (winners.length < rows.length) {
@@ -548,6 +600,10 @@ ON CONFLICT(prompt) DO UPDATE SET
 				}
 			})
 			.immediate();
+		if (rebuilt) {
+			const identity = sqliteFileIdentity(this.#dbPath);
+			if (identity !== undefined) this.#checkedIdentity = identity;
+		}
 		return rebuilt;
 	}
 
@@ -589,6 +645,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 				return;
 			}
 			source = new Database(backupPath, { readonly: true });
+			const highWater = readHistorySequence(source);
 			const { rows, damagedRegions } = readDamagedSqliteRows<HistoryRow>(
 				source,
 				"history",
@@ -601,6 +658,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 				.transaction(() => {
 					if (applied.get(backupPath)) return;
 					this.#insertRows(salvaged);
+					restoreHistorySequence(this.#db, highWater);
 					salvageSessionIndex(backup, this.#db);
 					this.#db.query("INSERT INTO history_salvage_applied (backup_path) VALUES (?)").run(backupPath);
 				})
