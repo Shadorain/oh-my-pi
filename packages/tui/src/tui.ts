@@ -1750,7 +1750,7 @@ export class TUI extends Container {
 		this.#resizeSettleTimer?.cancel();
 		this.#resizeSettleTimer = undefined;
 		if (this.#altActive || this.#resizeAltActive) {
-			this.terminal.write(`${this.#takePendingAltEnter()}${this.#keyboardEnhancementExit()}\x1b[?1049l`);
+			this.terminal.write(`${this.#takePendingAltEnter()}${this.#altScreenExit()}`);
 			setAltScreenActive(false);
 			this.#altActive = false;
 			this.#resizeAltActive = false;
@@ -2061,7 +2061,7 @@ export class TUI extends Container {
 		this.#suppressResizeUntil = this.#renderScheduler.now() + 100;
 		this.#altPreviousLines = [];
 		this.#altPreparedRows = [];
-		const exitSequence = `${this.#keyboardEnhancementExit()}\x1b[?1049l`;
+		const exitSequence = this.#altScreenExit();
 		// Only the provider plan frame emits a pending exit, and an exit already
 		// pending (a fused overlay close) owns that slot.
 		if (this.#frameProvider !== undefined && this.#pendingAltExit === "") {
@@ -2590,7 +2590,7 @@ export class TUI extends Container {
 		this.#cancelResizeProbe();
 		if (this.#resizeAltActive) {
 			this.#resizeAltActive = false;
-			this.terminal.write(`${this.#takePendingAltEnter()}${this.#keyboardEnhancementExit()}\x1b[?1049l`);
+			this.terminal.write(`${this.#takePendingAltEnter()}${this.#altScreenExit()}`);
 			setAltScreenActive(false);
 		}
 		if (this.#altActive || this.#pendingAltExit) {
@@ -2602,7 +2602,7 @@ export class TUI extends Container {
 			const mouseExit = this.#mouseTracking !== "off" ? MOUSE_TRACKING_OFF : "";
 			const exitSequence = this.#pendingAltExit
 				? `${this.#takePendingAltEnter()}${this.#pendingAltExit}${mouseExit}`
-				: `${mouseExit}${this.#keyboardEnhancementExit()}\x1b[?1049l`;
+				: `${mouseExit}${this.#altScreenExit()}`;
 			this.terminal.write(exitSequence);
 			setAltScreenActive(false);
 			this.#altActive = false;
@@ -3770,8 +3770,7 @@ export class TUI extends Container {
 			// restore it in the fused exit or later frames see matching states
 			// and inline click/hover stays dead until the setting toggles.
 			const mouseEnter = wantMouse !== "off" && this.#mouseTracking === "off" ? MOUSE_TRACKING_ON : "";
-			const enhancementExit = this.#keyboardEnhancementExit();
-			const exitSequence = `${mouseExit}${mouseEnter}${enhancementExit}\x1b[?1049l`;
+			const exitSequence = `${mouseExit}${mouseEnter}${this.#altScreenExit()}`;
 			// Session replacement finishes while its fullscreen selector still
 			// covers the old normal buffer. Fuse the restore into the destructive
 			// repaint so no stale frame can become visible between writes.
@@ -4312,14 +4311,15 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Resolve the active keyboard-enhancement exit sequence. Falls back to popping
-	 * kitty whenever a custom Terminal exposes its push sequence but predates the
-	 * `keyboardEnhancementExitSequence` property.
+	 * Leave the alternate screen: pop its keyboard-enhancement frame first, then
+	 * re-assert the main-screen mode for terminals that lose it on `?1049l`.
+	 * Falls back to popping kitty whenever a custom Terminal exposes its push
+	 * sequence but predates the `keyboardEnhancementExitSequence` property.
 	 */
-	#keyboardEnhancementExit(): string {
+	#altScreenExit(): string {
 		const exit = this.terminal.keyboardEnhancementExitSequence;
-		if (exit !== undefined) return exit ?? "";
-		return this.terminal.kittyEnableSequence ? "\x1b[<u" : "";
+		const keyboardExit = exit !== undefined ? (exit ?? "") : this.terminal.kittyEnableSequence ? "\x1b[<u" : "";
+		return `${keyboardExit}\x1b[?1049l${this.terminal.keyboardEnhancementRestoreSequence ?? ""}`;
 	}
 
 	/**
