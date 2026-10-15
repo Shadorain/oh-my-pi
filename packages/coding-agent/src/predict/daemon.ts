@@ -14,7 +14,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type PredictedWord, TextPredictor } from "@oh-my-pi/pi-natives";
 import { getHistoryDbPath, getPredictStateDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
-import { withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
+import { sqliteFileIdentity, withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
 import { JsonLineServer } from "../subprocess/jsonl-server";
 import { openSqliteReadConnectionSync } from "../tools/sqlite-reader";
 import { blendPredictions } from "./blend";
@@ -50,18 +50,34 @@ const OPEN_RETRY_MS = 60_000;
 const WEIGHTS_RECHECK_MS = 5_000;
 const CURSOR_FILE = "cursor.json";
 
-/** Persisted history cursor, or `undefined` when the engine has no persisted state yet. */
-async function readCursor(stateDir: string): Promise<number | undefined> {
+export interface HistoryCursor {
+	historyId: number;
+	historyIdentity?: string;
+}
+
+/** A legacy cursor without an identity re-ingests once rather than skipping a replacement's low ids. */
+async function readCursor(stateDir: string): Promise<HistoryCursor | undefined> {
 	try {
 		const raw: unknown = await Bun.file(path.join(stateDir, CURSOR_FILE)).json();
-		if (typeof raw === "object" && raw !== null && "historyId" in raw && typeof raw.historyId === "number") {
-			return raw.historyId;
+		if (
+			typeof raw === "object" &&
+			raw !== null &&
+			"historyId" in raw &&
+			typeof raw.historyId === "number" &&
+			Number.isSafeInteger(raw.historyId) &&
+			raw.historyId >= 0
+		) {
+			return {
+				historyId: raw.historyId,
+				historyIdentity:
+					"historyIdentity" in raw && typeof raw.historyIdentity === "string" ? raw.historyIdentity : undefined,
+			};
 		}
-		return 0;
+		return { historyId: 0 };
 	} catch (error) {
 		if (isEnoent(error)) return undefined;
 		logger.warn("text-predict: unreadable history cursor; re-ingesting", { stateDir, error: String(error) });
-		return 0;
+		return { historyId: 0 };
 	}
 }
 
@@ -122,6 +138,8 @@ export class Engine {
 	#seed: boolean;
 	/** Cursor value covered by the last successful persist. */
 	#persistedCursor: number;
+	#historyIdentity?: string;
+	#persistedIdentity?: string;
 	#dirty = false;
 	#ingesting: Promise<number> = Promise.resolve(0);
 
@@ -129,15 +147,17 @@ export class Engine {
 		readonly method: TextPredictMethod,
 		readonly stateDir: string,
 		readonly predictor: TextPredictor,
-		cursor: number | undefined,
+		checkpoint: HistoryCursor | undefined,
 	) {
-		this.cursor = cursor ?? 0;
+		this.cursor = checkpoint?.historyId ?? 0;
+		this.#historyIdentity = checkpoint?.historyIdentity;
+		this.#persistedIdentity = this.#historyIdentity;
 		this.#persistedCursor = this.cursor;
-		this.#seed = cursor === undefined;
+		this.#seed = checkpoint === undefined;
 	}
 
 	get dirty(): boolean {
-		return this.#dirty || this.cursor !== this.#persistedCursor;
+		return this.#dirty || this.cursor !== this.#persistedCursor || this.#historyIdentity !== this.#persistedIdentity;
 	}
 
 	markDirty(): void {
@@ -159,11 +179,13 @@ export class Engine {
 	async persist(): Promise<void> {
 		if (!this.dirty) return;
 		const cursor = this.cursor;
+		const historyIdentity = this.#historyIdentity;
 		this.#dirty = false;
 		try {
 			await this.predictor.persist();
-			await Bun.write(path.join(this.stateDir, CURSOR_FILE), JSON.stringify({ historyId: cursor }));
+			await Bun.write(path.join(this.stateDir, CURSOR_FILE), JSON.stringify({ historyId: cursor, historyIdentity }));
 			this.#persistedCursor = cursor;
+			this.#persistedIdentity = historyIdentity;
 		} catch (error) {
 			this.#dirty = true;
 			throw error;
@@ -182,16 +204,20 @@ export class Engine {
 			ingested += prompts.length;
 		}
 		for (;;) {
-			let rows: Array<{ id: number; prompt: string }>;
+			let batch: { rows: Array<{ id: number; prompt: string }>; identity: string; cursor: number };
 			try {
-				rows = withSqliteStoreLease(historyDbPath, () => {
+				batch = withSqliteStoreLease(historyDbPath, () => {
 					const db = openSqliteReadConnectionSync(historyDbPath);
 					try {
-						return db
+						const identity = sqliteFileIdentity(historyDbPath);
+						if (typeof identity !== "string") throw new Error("Could not identify the history store");
+						const cursor = identity === this.#historyIdentity ? this.cursor : 0;
+						const rows = db
 							.query<{ id: number; prompt: string }, [number, number]>(
 								"SELECT id, prompt FROM history WHERE id > ? AND typeof(prompt) = 'text' ORDER BY id LIMIT ?",
 							)
-							.all(this.cursor, INGEST_BATCH);
+							.all(cursor, INGEST_BATCH);
+						return { rows, identity, cursor };
 					} finally {
 						db.close();
 					}
@@ -201,9 +227,10 @@ export class Engine {
 				if (!isEnoent(error)) logger.debug("text-predict: history unavailable", { error: String(error) });
 				return ingested;
 			}
-			if (rows.length === 0) break;
-			await this.predictor.observe(rows.map(row => row.prompt));
-			this.cursor = rows.at(-1)?.id ?? this.cursor;
+			const { rows, identity, cursor } = batch;
+			if (rows.length) await this.predictor.observe(rows.map(row => row.prompt));
+			this.cursor = rows.at(-1)?.id ?? cursor;
+			this.#historyIdentity = identity;
 			ingested += rows.length;
 			if (rows.length < INGEST_BATCH) break;
 		}
@@ -346,7 +373,7 @@ class TextPredictDaemon {
 		// SmolLM only serves the blend, which gates on its own score.
 		const showThreshold = method === "smollm" ? 0 : undefined;
 		let predictor = new TextPredictor({ method, stateDir, modelDir, showThreshold });
-		let cursor: number | undefined;
+		let cursor: HistoryCursor | undefined;
 		try {
 			await predictor.ready();
 			cursor = await readCursor(stateDir);

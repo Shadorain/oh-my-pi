@@ -3,9 +3,10 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDir, getHistoryDbPath, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { readSqlite } from "@oh-my-pi/pi-coding-agent/tools/read-sqlite";
 import {
 	listTables,
 	parseSqlitePathCandidates,
@@ -343,6 +344,44 @@ describe("SQLite tool support", () => {
 		const text = getText(result);
 
 		expect(text).toContain("Third; note");
+	});
+
+	it("reads a history alias from a complete WAL snapshot and keeps raw queries read-only", async () => {
+		const originalDir = getAgentDir();
+		const agentDir = path.join(tmpDir, "history-snapshot-agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		setAgentDir(agentDir);
+		const dbPath = getHistoryDbPath();
+		const alias = path.join(tmpDir, "history-alias.db");
+		const writer = new Database(dbPath);
+		try {
+			writer.run("PRAGMA journal_mode=WAL");
+			writer.run("CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT)");
+			writer.run("INSERT INTO entries VALUES (1, 'committed in WAL')");
+			await fs.symlink(dbPath, alias);
+			const result = await readSqlite({ absolutePath: alias, sqliteSubPath: "entries", queryString: "" });
+			expect(getText(result)).toContain("committed in WAL");
+			await expect(
+				readSqlite({
+					absolutePath: alias,
+					sqliteSubPath: "",
+					queryString: "q=DELETE%20FROM%20entries",
+				}),
+			).rejects.toThrow(/readonly/i);
+			const copyPath = path.join(tmpDir, "forbidden-history-copy.db");
+			await expect(
+				readSqlite({
+					absolutePath: alias,
+					sqliteSubPath: "",
+					queryString: `q=${encodeURIComponent(`VACUUM INTO '${copyPath.replaceAll("'", "''")}'`)}`,
+				}),
+			).rejects.toThrow(/readonly/i);
+			expect(await Bun.file(copyPath).exists()).toBe(false);
+			expect(writer.query("SELECT value FROM entries").all()).toEqual([{ value: "committed in WAL" }]);
+		} finally {
+			writer.close();
+			setAgentDir(originalDir);
+		}
 	});
 
 	it("rejects mutating raw queries on the readonly connection", async () => {

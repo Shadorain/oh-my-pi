@@ -12,7 +12,14 @@ import type {
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 
-import { getHistoryDbPath, isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	getHistoryDbPath,
+	isEnoent,
+	isRecord,
+	normalizePathForComparison,
+	prompt,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
 import {
 	type ArchiveMemberContent,
@@ -755,7 +762,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Writes to the process-wide store must not overlap corruption recovery's
 			// quarantine/replace: run the whole open..close inside the shared lease.
-			if (path.resolve(resolvedSqlitePath.absolutePath) === path.resolve(getHistoryDbPath())) {
+			if (
+				normalizePathForComparison(resolvedSqlitePath.absolutePath, { allowMissing: true }) ===
+				normalizePathForComparison(getHistoryDbPath(), { allowMissing: true })
+			) {
 				return withSqliteStoreLease(resolvedSqlitePath.absolutePath, run);
 			}
 			return run();

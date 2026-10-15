@@ -2,6 +2,7 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { normalizePathForComparison, resolveEquivalentPath } from "./dirs";
 import { getDbBusyTimeoutMs } from "./env";
 import { withFileLockSync } from "./file-lock";
 import { isEnoent } from "./fs-error";
@@ -51,8 +52,7 @@ type SqliteFileIdentity = string | null | undefined;
 const pendingCorruptHandles = new Map<string, Set<Database>>();
 
 function corruptHandleKey(dbPath: string): string {
-	const resolved = path.resolve(dbPath);
-	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+	return normalizePathForComparison(dbPath, { allowMissing: true });
 }
 
 function registerCorruptHandle(dbPath: string, db: Database | undefined): void {
@@ -150,8 +150,8 @@ class SqliteAttemptFailure extends Error {
 /** Generation key of the store file (`dev:ino:birthtime`); `null` while absent, `undefined` on stat failure. */
 export function sqliteFileIdentity(dbPath: string): SqliteFileIdentity {
 	try {
-		const stat = fs.statSync(dbPath);
-		return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+		const stat = fs.statSync(dbPath, { bigint: true });
+		return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
 	} catch (error) {
 		return isEnoent(error) ? null : undefined;
 	}
@@ -277,15 +277,29 @@ function quarantineCorruptSqliteStore(
 		try {
 			fs.chmodSync(`${dbPath}${suffix}`, 0o600);
 			fs.copyFileSync(`${dbPath}${suffix}`, `${backupPath}${suffix}`, fs.constants.COPYFILE_EXCL);
+			const fd = fs.openSync(`${backupPath}${suffix}`, "r+");
+			try {
+				fs.fsyncSync(fd);
+			} finally {
+				fs.closeSync(fd);
+			}
 			preserved.push(suffix);
 		} catch (error) {
 			if (isEnoent(error) && suffix !== "") continue;
 			throw error;
 		}
 	}
+	if (process.platform !== "win32") {
+		const directory = fs.openSync(path.dirname(backupPath), "r");
+		try {
+			fs.fsyncSync(directory);
+		} finally {
+			fs.closeSync(directory);
+		}
+	}
 	db?.close();
-	// All current-version store operations hold the recovery lease and close
-	// their handles before releasing it, so no peer can retain this inode.
+	// History participants close under this lease; other stores may still own
+	// in-process handles registered with the quarantine hook.
 	if (process.platform === "win32") closePeerCorruptHandles(dbPath, db);
 	runQuarantineHooks(dbPath);
 	options.onCorruptionPreserved?.(backupPath, error);
@@ -375,6 +389,7 @@ export async function openSqliteDatabase<T>(
 	initialize: (db: Database) => T | Promise<T>,
 	options: SqliteOpenOptions = {},
 ): Promise<T> {
+	dbPath = resolveEquivalentPath(dbPath, { allowMissing: true });
 	try {
 		return await openWithBusyRetries(dbPath, initialize, options);
 	} catch (error) {
@@ -397,6 +412,7 @@ export function openSqliteDatabaseSync<T>(
 	initialize: (db: Database) => T,
 	options: SqliteOpenOptions = {},
 ): T {
+	dbPath = resolveEquivalentPath(dbPath, { allowMissing: true });
 	try {
 		return openOnce(dbPath, initialize, options);
 	} catch (error) {

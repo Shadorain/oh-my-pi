@@ -41,7 +41,7 @@ function requiresWalSidecarInitializationSync(filePath: string): boolean {
 	return !fs.existsSync(`${filePath}-wal`) || !fs.existsSync(`${filePath}-shm`);
 }
 
-function configureSqliteReadConnection(db: Database): Database {
+export function configureSqliteReadConnection(db: Database): Database {
 	try {
 		db.run("PRAGMA query_only = ON");
 		db.run("PRAGMA busy_timeout = 3000");
@@ -810,6 +810,8 @@ export function executeReadQuery(
 		throw new ToolError("SQLite raw queries do not support bound parameters");
 	}
 	const columns = [...statement.columnNames];
+	// query_only rejects VACUUM INTO only after SQLite creates its output file.
+	if (columns.length === 0) throw new ToolError("SQLite raw queries are readonly and must return columns");
 	const rows: SqliteRow[] = [];
 	let truncated = false;
 	for (const row of statement.iterate()) {

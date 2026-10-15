@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { lookupSessionTitle, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
@@ -415,6 +416,10 @@ function seedSalvageBackup(backupPath: string): void {
 	backup.close();
 }
 
+function queueBackup(dbPath: string, backupPath: string): void {
+	fs.writeFileSync(`${dbPath}.pending-salvage`, JSON.stringify([{ backupName: path.basename(backupPath) }]));
+}
+
 it("salvages a recorded backup whose earlier pass was deferred", async () => {
 	tempDir = TempDir.createSync("@omp-history-storage-pending-salvage-");
 	const dbPath = tempDir.join("history.db");
@@ -422,7 +427,7 @@ it("salvages a recorded backup whose earlier pass was deferred", async () => {
 	// A prior open crashed or lost the write-lock race mid-salvage: only the
 	// backup and its marker remain.
 	seedSalvageBackup(backupPath);
-	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	queueBackup(dbPath, backupPath);
 
 	const storage = HistoryStorage.open(dbPath);
 	expect(storage.getRecent(10).map(entry => entry.prompt)).toEqual(["stranded prompt"]);
@@ -434,21 +439,23 @@ it("defers a salvage whose insert loses the write lock to a peer, then retries i
 	const dbPath = tempDir.join("history.db");
 	const backupPath = tempDir.join("history.db.corrupt-backup");
 	seedSalvageBackup(backupPath);
-	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	queueBackup(dbPath, backupPath);
 
 	// A peer takes the replacement's write lock right before the salvage insert
 	// and holds it past the busy timeout — the same race gc-cli's long
 	// transaction creates.
 	const readDamaged = utils.readDamagedSqliteRows;
 	let peer: Database | undefined;
-	vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation((db, table, columns, predicate) => {
-		const result = readDamaged(db, table, columns, predicate);
-		if (table === "history" && !peer) {
-			peer = new Database(dbPath);
-			peer.run("BEGIN IMMEDIATE");
-		}
-		return result;
-	});
+	vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation(
+		<T>(db: Database, table: string, columns: string, predicate?: string) => {
+			const result = readDamaged<T>(db, table, columns, predicate);
+			if (table === "history" && !peer) {
+				peer = new Database(dbPath);
+				peer.run("BEGIN IMMEDIATE");
+			}
+			return result;
+		},
+	);
 
 	try {
 		const locked = HistoryStorage.open(dbPath);
@@ -501,7 +508,7 @@ it("records recovery before the first backup scan and retains it when scanning f
 		throw new Error("interrupted backup scan");
 	});
 	HistoryStorage.open(dbPath);
-	expect(recordedBackup).toBeDefined();
+	if (recordedBackup === undefined) throw new Error("Backup scan did not run");
 	expect(fs.readFileSync(`${dbPath}.pending-salvage`, "utf8").trim()).toBe(recordedBackup);
 	scan.mockRestore();
 	HistoryStorage.close();
@@ -517,13 +524,13 @@ it("does not count prompts or copy recaps twice when a committed backup is repla
 	const dbPath = tempDir.join("history.db");
 	const backupPath = tempDir.join("history.db.corrupt-backup");
 	await seedDamagedStore(backupPath, 2);
-	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	queueBackup(dbPath, backupPath);
 	const first = HistoryStorage.open(dbPath);
 	expect(first.getRecent(10).map(entry => entry.useCount)).toEqual([1, 1]);
 	await first.add("second prompt", "/new", "new-session");
 	HistoryStorage.close();
 	// A crash after COMMIT or a failed unlink leaves exactly this journal state.
-	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	queueBackup(dbPath, backupPath);
 	const replayed = HistoryStorage.open(dbPath);
 	expect(replayed.getRecent(10).map(entry => ({ prompt: entry.prompt, count: entry.useCount }))).toEqual([
 		{ prompt: "second prompt", count: 2 },
@@ -543,7 +550,7 @@ it("rolls back prompt salvage and retries all tables when session-index recovery
 	const dbPath = tempDir.join("history.db");
 	const backupPath = tempDir.join("history.db.corrupt-backup");
 	await seedDamagedStore(backupPath, 2);
-	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	queueBackup(dbPath, backupPath);
 	const readDamaged = utils.readDamagedSqliteRows;
 	const scan = vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation((db, table, columns, predicate) => {
 		if (table === "session_recaps") throw new Error("interrupted index scan");
@@ -714,4 +721,249 @@ it("recovers operation-level corruption without rescanning a healthy generation 
 	}
 	expect(storage.getRecent(10).map(row => row.prompt)).toEqual(["still readable"]);
 	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
+});
+
+it.each(["fts", "substring"])("repairs %s corruption found by search after the generation was checked", async kind => {
+	tempDir = TempDir.createSync("@omp-history-search-corruption-");
+	const dbPath = tempDir.join("history.db");
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("searchable prompt");
+	const raw = new Database(dbPath);
+	if (kind === "fts") {
+		raw.run("PRAGMA journal_mode=DELETE");
+		const block = raw
+			.query<{ block: Uint8Array }, []>("SELECT block FROM history_fts_data WHERE id > 10 LIMIT 1")
+			.get()!.block;
+		raw.close();
+		const bytes = fs.readFileSync(dbPath);
+		const offset = bytes.indexOf(block);
+		expect(offset).toBeGreaterThan(0);
+		const fd = fs.openSync(dbPath, "r+");
+		try {
+			fs.writeSync(fd, new Uint8Array(block.length).fill(255), 0, block.length, offset);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} else {
+		raw.run("PRAGMA journal_mode=DELETE");
+		const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+		const root = raw
+			.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name='idx_history_created_at'")
+			.get()!.rootpage;
+		raw.close();
+		const fd = fs.openSync(dbPath, "r+");
+		try {
+			fs.writeSync(fd, Buffer.alloc(pageSize, 255), 0, pageSize, (root - 1) * pageSize);
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+	expect(storage.search("searchable", 10).map(row => row.prompt)).toEqual(["searchable prompt"]);
+	expect(fs.readdirSync(tempDir.path()).some(name => name.startsWith("history.db.corrupt-"))).toBe(true);
+	await storage.add("new searchable prompt");
+	expect(storage.search("new searchable", 10).map(row => row.prompt)).toEqual(["new searchable prompt"]);
+});
+
+it("retires an unreadable source without deleting evidence or blocking recovery of a later generation", async () => {
+	tempDir = TempDir.createSync("@omp-history-terminal-source-");
+	const dbPath = tempDir.join("history.db");
+	const damaged = new Uint8Array(4096).fill(255);
+	await Bun.write(dbPath, damaged);
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("replacement prompt");
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+	const backups = fs.readdirSync(tempDir.path()).filter(name => /^history\.db\.corrupt-.*[^-]$/.test(name));
+	expect(backups.length).toBe(1);
+	expect(await Bun.file(tempDir.join(backups[0])).bytes()).toEqual(damaged);
+	HistoryStorage.close();
+	const raw = new Database(dbPath);
+	raw.run("PRAGMA journal_mode=DELETE");
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const root = raw
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name='idx_history_created_at'")
+		.get()!.rootpage;
+	raw.close();
+	const fd = fs.openSync(dbPath, "r+");
+	try {
+		fs.writeSync(fd, Buffer.alloc(pageSize, 255), 0, pageSize, (root - 1) * pageSize);
+	} finally {
+		fs.closeSync(fd);
+	}
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(row => row.prompt),
+	).toEqual(["replacement prompt"]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
+it("keeps commits made after a failed quarantine unlink when that same source is retried", async () => {
+	tempDir = TempDir.createSync("@omp-history-quarantine-retry-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 2);
+	const unlink = fs.unlinkSync;
+	const fail = vi.spyOn(fs, "unlinkSync").mockImplementation(target => {
+		if (String(target) === dbPath) throw new Error("unlink blocked");
+		unlink(target);
+	});
+	expect(() => HistoryStorage.open(dbPath)).toThrow("unlink blocked");
+	fail.mockRestore();
+	const peer = new Database(dbPath);
+	peer
+		.query("INSERT INTO session_recaps (session_id, cwd, recap, created_at) VALUES (?, ?, ?, ?)")
+		.run("new-session", "/project", "committed between attempts", 10);
+	peer.close();
+	HistoryStorage.open(dbPath);
+	const recovered = new Database(dbPath, { readonly: true });
+	try {
+		expect(recovered.query("SELECT recap FROM session_recaps WHERE session_id='new-session'").all()).toEqual([
+			{ recap: "committed between attempts" },
+		]);
+	} finally {
+		recovered.close();
+	}
+});
+
+it.each(["missing", "schema"])("retires a %s-damaged backup and keeps any readable index rows", async kind => {
+	tempDir = TempDir.createSync("@omp-history-terminal-backup-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-terminal");
+	if (kind === "schema") {
+		const source = new Database(backupPath);
+		source.run("CREATE TABLE session_titles (session_id TEXT PRIMARY KEY, title TEXT, updated_at INTEGER)");
+		source.run("INSERT INTO session_titles VALUES ('session-a', 'readable title', 1)");
+		source.close();
+	}
+	queueBackup(dbPath, backupPath);
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("new prompt");
+	expect(storage.getRecent(10).map(row => row.prompt)).toEqual(["new prompt"]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+	if (kind === "schema") {
+		const check = new Database(dbPath, { readonly: true });
+		try {
+			expect(check.query("SELECT title FROM session_titles").all()).toEqual([{ title: "readable title" }]);
+		} finally {
+			check.close();
+		}
+	}
+});
+
+it("preserves a sequence above the JavaScript safe integer range without rounding it during rebuild", async () => {
+	tempDir = TempDir.createSync("@omp-history-wide-sequence-");
+	const dbPath = tempDir.join("history.db");
+	await HistoryStorage.open(dbPath).add("survivor");
+	HistoryStorage.close();
+	const raw = new Database(dbPath);
+	raw.run("UPDATE sqlite_sequence SET seq=9007199254740993 WHERE name='history'");
+	raw.run("PRAGMA user_version=1");
+	raw.close();
+	await HistoryStorage.open(dbPath).add("new prompt");
+	const check = new Database(dbPath, { readonly: true });
+	try {
+		expect(check.query("SELECT CAST(id AS TEXT) AS id FROM history WHERE prompt='new prompt'").get()).toEqual({
+			id: "9007199254740994",
+		});
+	} finally {
+		check.close();
+	}
+});
+
+it("preserves a deferred older source while recovering a newly damaged replacement", async () => {
+	tempDir = TempDir.createSync("@omp-history-multiple-generations-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-older");
+	seedSalvageBackup(backupPath);
+	queueBackup(dbPath, backupPath);
+	const scan = utils.readDamagedSqliteRows;
+	const blocked = vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation((db, table, columns, predicate) => {
+		if (db.filename === backupPath) throw new Error("temporary source interruption");
+		return scan(db, table, columns, predicate);
+	});
+	await HistoryStorage.open(dbPath).add("newer-generation prompt");
+	HistoryStorage.close();
+	const raw = new Database(dbPath);
+	raw.run("PRAGMA journal_mode=DELETE");
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const root = raw
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name='idx_history_created_at'")
+		.get()!.rootpage;
+	raw.close();
+	const fd = fs.openSync(dbPath, "r+");
+	try {
+		fs.writeSync(fd, Buffer.alloc(pageSize, 255), 0, pageSize, (root - 1) * pageSize);
+	} finally {
+		fs.closeSync(fd);
+	}
+	expect(
+		HistoryStorage.open(dbPath)
+			.search("newer-generation", 10)
+			.map(row => row.prompt),
+	).toEqual(["newer-generation prompt"]);
+	blocked.mockRestore();
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(row => row.prompt),
+	).toContain("stranded prompt");
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
+it("carries committed backup identities through a later recovery instead of counting the old source twice", async () => {
+	tempDir = TempDir.createSync("@omp-history-carried-ledger-");
+	const dbPath = tempDir.join("history.db");
+	const older = tempDir.join("history.db.corrupt-older");
+	seedSalvageBackup(older);
+	queueBackup(dbPath, older);
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(row => row.useCount),
+	).toEqual([1]);
+	HistoryStorage.close();
+	queueBackup(dbPath, older);
+	const raw = new Database(dbPath);
+	raw.run("PRAGMA journal_mode=DELETE");
+	const pageSize = raw.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+	const root = raw
+		.query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE name='idx_history_created_at'")
+		.get()!.rootpage;
+	raw.close();
+	const fd = fs.openSync(dbPath, "r+");
+	try {
+		fs.writeSync(fd, Buffer.alloc(pageSize, 255), 0, pageSize, (root - 1) * pageSize);
+	} finally {
+		fs.closeSync(fd);
+	}
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(row => row.useCount),
+	).toEqual([1]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
+it("does not replay a queued snapshot into the original generation that is still live", async () => {
+	tempDir = TempDir.createSync("@omp-history-live-source-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-before-unlink");
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("original prompt");
+	const sourceIdentity = utils.sqliteFileIdentity(dbPath);
+	fs.copyFileSync(dbPath, backupPath);
+	fs.writeFileSync(
+		`${dbPath}.pending-salvage`,
+		JSON.stringify([
+			{
+				backupName: path.basename(backupPath),
+				sourceIdentity,
+			},
+		]),
+	);
+	await storage.add("committed after failed unlink");
+	expect(storage.getRecent(10).map(row => ({ prompt: row.prompt, useCount: row.useCount }))).toEqual([
+		{ prompt: "committed after failed unlink", useCount: 1 },
+		{ prompt: "original prompt", useCount: 1 },
+	]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
 });

@@ -22,7 +22,7 @@
 import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getHistoryDbPath } from "@oh-my-pi/pi-utils/dirs";
+import { getHistoryDbPath, resolveEquivalentPath } from "@oh-my-pi/pi-utils/dirs";
 import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import {
@@ -62,7 +62,8 @@ let failedIdentity: string | null | undefined;
 let failedPathUnregister: (() => void) | undefined;
 
 function withSessionIndex<T>(operation: (index: SessionIndexHandle) => T): T | undefined {
-	const dbPath = getHistoryDbPath();
+	const dbPath = resolveEquivalentPath(getHistoryDbPath(), { allowMissing: true });
+	fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 	return withSqliteStoreLease(dbPath, () => {
 		if (failedPath === dbPath) {
 			const currentIdentity = sqliteFileIdentity(dbPath);
@@ -76,7 +77,6 @@ function withSessionIndex<T>(operation: (index: SessionIndexHandle) => T): T | u
 		const prepared: Statement[] = [];
 		let index: SessionIndexHandle;
 		try {
-			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 			db = new Database(dbPath);
 			// Install the busy handler BEFORE any lock-taking statement (see #2421).
 			db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
@@ -254,13 +254,14 @@ interface SalvagedRecapRow extends SessionRecapRow {
 	id: number;
 }
 
-/**
- * Copies the readable session-index rows of a quarantined history.db into its
- * replacement. A peer process may already have written there: a title keeps
- * the newer of the two, and a recap whose id is taken gets a fresh one.
- * Target failures propagate so the caller can roll back its salvage transaction.
- */
-export function salvageSessionIndex(source: Database, target: Database): void {
+export interface SalvagedSessionIndex {
+	titles: SessionTitleRow[];
+	recaps: SalvagedRecapRow[];
+	damagedRegions: number;
+}
+
+/** Read independently of the replacement, so source damage cannot be mistaken for a failed target write. */
+export function readSalvagedSessionIndex(source: Database): SalvagedSessionIndex {
 	const tables = new Set(
 		(source.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
 			row => row.name,
@@ -282,25 +283,23 @@ export function salvageSessionIndex(source: Database, target: Database): void {
 				"typeof(session_id) = 'text' AND typeof(cwd) = 'text' AND typeof(recap) = 'text' AND typeof(created_at) = 'integer'",
 			)
 		: { rows: [], damagedRegions: 0 };
-	target.transaction(() => {
-		target.run(SESSION_INDEX_DDL);
-		const insertTitle = target.query(`
+	return { titles: titles.rows, recaps: recaps.rows, damagedRegions: titles.damagedRegions + recaps.damagedRegions };
+}
+
+/** Restore a source snapshot inside the caller's salvage transaction. */
+export function restoreSalvagedSessionIndex(snapshot: SalvagedSessionIndex, target: Database): void {
+	target.run(SESSION_INDEX_DDL);
+	const insertTitle = target.query(`
 INSERT INTO session_titles (session_id, title, updated_at) VALUES (?, ?, ?)
 ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at
 WHERE excluded.updated_at > session_titles.updated_at
-		`);
-		const insertRecap = target.query(`
+	`);
+	const insertRecap = target.query(`
 INSERT INTO session_recaps (id, session_id, cwd, recap, created_at)
 VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5)
-		`);
-		for (const row of titles.rows) insertTitle.run(row.session_id, row.title, row.updated_at);
-		for (const row of recaps.rows) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);
-	})();
-	logger.warn("Session index salvaged from a corrupt history store", {
-		titles: titles.rows.length,
-		recaps: recaps.rows.length,
-		damagedRegions: titles.damagedRegions + recaps.damagedRegions,
-	});
+	`);
+	for (const row of snapshot.titles) insertTitle.run(row.session_id, row.title, row.updated_at);
+	for (const row of snapshot.recaps) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);
 }
 
 /** @internal Clear cached availability state — test-only. */

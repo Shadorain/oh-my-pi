@@ -4,13 +4,12 @@
 
 ### Added
 
-- Added `readDamagedSqliteRows()` to salvage readable rows from a damaged SQLite table, `assertSqliteQuickCheck()` to fail fast on a damaged store, and `onSqliteStoreQuarantine()` so long-lived connections release a corrupt store before it is quarantined ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
-- Added `withSqliteStoreLease()` to coordinate operation-scoped connections with cross-process database recovery ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+- Added `readDamagedSqliteRows()` to salvage readable rows, including negative rowids, from damaged SQLite tables, `assertSqliteQuickCheck()` to detect damaged stores, and `onSqliteStoreQuarantine()` hooks for releasing held connections ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+- Added `withSqliteStoreLease()` for operation-scoped connections and `sqliteFileIdentity()` for detecting database replacement generations ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
 ### Changed
 
-- `readDamagedSqliteRows()` recovers more readable rows around damaged pages — including negative rowids, which it now sweeps with descending seeks — and no longer hangs when salvage reaches a readable page beyond the current search interval ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
-- SQLite preservation callbacks now run before the corrupt store is removed, allowing durable recovery intent to be recorded before replacement ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+- SQLite recovery flushes preserved evidence before replacement, and path comparison helpers can retain canonical aliases while a target is temporarily missing ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.10.0] - 2026-10-12
 

@@ -5,7 +5,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getRecentSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { lookupSessionTitle, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import {
+	listSessionRecaps,
+	lookupSessionTitle,
+	recordSessionRecap,
+	recordSessionTitle,
+	resetSessionIndexForTests,
+} from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { getConfigRootDir, getHistoryDbPath, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { makeAssistantMessage } from "../session-manager/helpers";
 
@@ -52,6 +58,14 @@ describe("recent sessions title index", () => {
 		return { sessionDir: path.dirname(sessionFile), sessionFile };
 	}
 
+	it("creates the agent directory before acquiring a filesystem-backed history lease", () => {
+		setAgentDir(path.join(testAgentDir, "fresh", "agent"));
+		recordSessionTitle("fresh", "New title");
+		recordSessionRecap("fresh", "/project", "New recap");
+		expect(lookupSessionTitle("fresh")).toBe("New title");
+		expect(listSessionRecaps({ sessionIds: ["fresh"] }).map(row => row.recap)).toEqual(["New recap"]);
+	});
+
 	it("resolves a titled session from the index without reading file contents", async () => {
 		const { sessionDir, sessionFile } = await createTitledSession("Indexed title");
 
@@ -80,7 +94,7 @@ describe("recent sessions title index", () => {
 				updated_at INTEGER NOT NULL
 			)
 		`);
-		replacement.run("INSERT INTO session_titles VALUES (?, ?, ?)", "session-a", "recovered title", 1);
+		replacement.query("INSERT INTO session_titles VALUES (?, ?, ?)").run("session-a", "recovered title", 1);
 		replacement.close();
 		fs.renameSync(replacementPath, dbPath);
 

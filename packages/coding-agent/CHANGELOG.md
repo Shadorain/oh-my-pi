@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed history recall crashes from a damaged `history.db`; recovery preserves readable prompts, titles, and recaps, retries interrupted recovery without duplicating data, and coordinates replacement with other running omp processes ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+- Fixed history recall crashes after database damage, including interrupted recovery, repeated corruption, and text prediction missing newly submitted prompts ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.11.0] - 2026-10-14
 

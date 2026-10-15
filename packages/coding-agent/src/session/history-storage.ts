@@ -9,11 +9,12 @@ import {
 	logger,
 	openSqliteDatabaseSync,
 	readDamagedSqliteRows,
+	resolveEquivalentPath,
 	sqliteFileIdentity,
 	withSqliteStoreLease,
 } from "@oh-my-pi/pi-utils";
 import { writeFileAtomicallySync } from "../utils/atomic-file";
-import { salvageSessionIndex } from "./session-index";
+import { readSalvagedSessionIndex, restoreSalvagedSessionIndex, type SalvagedSessionIndex } from "./session-index";
 
 /** A unique prompt with provenance from its most recent submission. */
 export interface HistoryEntry {
@@ -122,35 +123,28 @@ function historyRowColumns(db: Database): string {
 	return `id, prompt, created_at, cwd, ${sessionId}, ${useCount}`;
 }
 
-/**
- * Reads `history`'s AUTOINCREMENT high-water mark. `null` when the store
- * predates AUTOINCREMENT or the sequence row itself is unreachable — losing the
- * mark degrades to pre-fix behavior, so a damaged `sqlite_sequence` never
- * blocks salvage.
- */
-function readHistorySequence(db: Database): number | null {
+/** Keep the allocation high-water mark in SQLite's integer domain, including values above 2^53. */
+function readHistorySequence(db: Database): string | null {
 	if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'").get()) return null;
 	try {
-		const row = db.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name = 'history'").get();
-		return typeof row?.seq === "number" ? row.seq : null;
+		const row = db
+			.query<{ seq: string }, []>(
+				"SELECT CAST(seq AS TEXT) AS seq FROM sqlite_sequence WHERE name = 'history' AND typeof(seq)='integer' AND seq >= 0",
+			)
+			.get();
+		return row?.seq ?? null;
 	} catch (error) {
 		logger.warn("HistoryStorage could not read the history sequence", { error: String(error) });
 		return null;
 	}
 }
 
-/**
- * Raises `history`'s sequence to `seq` without lowering it — row-preserving
- * inserts already advanced it to the largest surviving id. Predictor cursors
- * persist `WHERE id > ?` checkpoints across process restarts, so a rebuild or
- * recovery that resets the sequence makes fresh prompts land under the cursor
- * and skip learning until ids catch up.
- */
-function restoreHistorySequence(db: Database, seq: number | null): void {
+/** Predictor checkpoints must remain below newly allocated ids even when the newest rows were deleted. */
+function restoreHistorySequence(db: Database, seq: string | null): void {
 	if (seq === null) return;
-	db.query("UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = 'history'").run(seq);
+	db.query("UPDATE sqlite_sequence SET seq = max(seq, CAST(? AS INTEGER)) WHERE name = 'history'").run(seq);
 	db.query(
-		"INSERT INTO sqlite_sequence (name, seq) SELECT 'history', ? WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'history')",
+		"INSERT INTO sqlite_sequence (name, seq) SELECT 'history', CAST(? AS INTEGER) WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'history')",
 	).run(seq);
 }
 
@@ -186,59 +180,65 @@ function pendingSalvagePath(dbPath: string): string {
 }
 
 interface PendingSalvage {
-	backupPath: string;
+	backupName: string;
 	sourceIdentity?: string;
 }
 
-/** Accepts the earlier plain-path journal as well as the durable journal record. */
-function readPendingSalvage(dbPath: string): PendingSalvage | undefined {
+/** GC must not delete rows that a queued snapshot can restore immediately afterwards. */
+export function hasPendingHistorySalvage(dbPath: string): boolean {
+	return readPendingSalvage(resolveEquivalentPath(dbPath, { allowMissing: true })).length > 0;
+}
+
+function readPendingSalvage(dbPath: string): PendingSalvage[] {
 	try {
-		const content = fs.readFileSync(pendingSalvagePath(dbPath), "utf8").trim();
-		if (!content) throw new Error("Empty history salvage journal");
-		if (!content.startsWith("{")) return { backupPath: content };
-		const record: unknown = JSON.parse(content);
-		if (
-			!record ||
-			typeof record !== "object" ||
-			!("backupPath" in record) ||
-			typeof record.backupPath !== "string" ||
-			!record.backupPath ||
-			("sourceIdentity" in record && typeof record.sourceIdentity !== "string")
-		)
-			throw new Error("Invalid history salvage journal");
-		return {
-			backupPath: record.backupPath,
-			sourceIdentity:
-				"sourceIdentity" in record && typeof record.sourceIdentity === "string" ? record.sourceIdentity : undefined,
-		};
+		const records: unknown = JSON.parse(fs.readFileSync(pendingSalvagePath(dbPath), "utf8"));
+		if (!Array.isArray(records)) throw new Error("Invalid history salvage journal");
+		return records.map((record: unknown) => {
+			if (
+				!record ||
+				typeof record !== "object" ||
+				!("backupName" in record) ||
+				typeof record.backupName !== "string" ||
+				!record.backupName ||
+				path.basename(record.backupName) !== record.backupName ||
+				record.backupName === "." ||
+				record.backupName === ".." ||
+				("sourceIdentity" in record && typeof record.sourceIdentity !== "string")
+			)
+				throw new Error("Invalid history salvage journal");
+			return {
+				backupName: record.backupName,
+				sourceIdentity:
+					"sourceIdentity" in record && typeof record.sourceIdentity === "string"
+						? record.sourceIdentity
+						: undefined,
+			};
+		});
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
-		return undefined;
+		return [];
 	}
 }
 
-function recordPendingSalvage(dbPath: string, backupPath: string, preserving = false): void {
+function recordPendingSalvage(dbPath: string, backupPath: string): void {
 	const pending = readPendingSalvage(dbPath);
-	if (pending?.backupPath === backupPath) return;
-	let sourceIdentity: string | undefined;
-	if (preserving) {
-		const stat = fs.statSync(dbPath, { bigint: true });
-		sourceIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
-	}
-	// An interrupted quarantine can copy the same original again. Retain its
-	// first durable snapshot, but never discard a different pending generation.
-	if (pending) {
-		if (sourceIdentity && pending.sourceIdentity === sourceIdentity) return;
-		throw new Error(`History recovery still pending from ${pending.backupPath}`);
-	}
-	writeFileAtomicallySync(pendingSalvagePath(dbPath), JSON.stringify({ backupPath, sourceIdentity }));
+	const stat = fs.statSync(dbPath, { bigint: true });
+	const sourceIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+	// A failed unlink leaves a writable original. Supersede its older snapshot
+	// rather than replaying both or losing writes committed between retries.
+	const remaining = pending.filter(record => record.sourceIdentity !== sourceIdentity);
+	remaining.push({ backupName: path.basename(backupPath), sourceIdentity });
+	writeFileAtomicallySync(pendingSalvagePath(dbPath), JSON.stringify(remaining));
 }
 
-/** Drops the marker only when it still names `backupPath`, so a newer marker survives. */
 function clearPendingSalvage(dbPath: string, backupPath: string): void {
-	if (readPendingSalvage(dbPath)?.backupPath !== backupPath) return;
+	const backupName = path.basename(backupPath);
+	const pending = readPendingSalvage(dbPath);
+	const remaining = pending.filter(record => record.backupName !== backupName);
+	if (remaining.length === pending.length) return;
 	try {
-		fs.rmSync(pendingSalvagePath(dbPath), { force: true });
+		if (remaining.length) writeFileAtomicallySync(pendingSalvagePath(dbPath), JSON.stringify(remaining));
+		else fs.rmSync(pendingSalvagePath(dbPath), { force: true });
 	} catch (error) {
 		logger.warn("Pending history salvage marker could not be removed", { error: String(error) });
 	}
@@ -265,7 +265,7 @@ export class HistoryStorage {
 	#substringStmts = new Map<number, Statement>();
 
 	private constructor(dbPath: string) {
-		this.#dbPath = dbPath;
+		this.#dbPath = resolveEquivalentPath(dbPath, { allowMissing: true });
 	}
 
 	#initialize(db: Database): void {
@@ -297,6 +297,7 @@ END;
 			try {
 				this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
 			} catch (error) {
+				if (isSqliteCorruptionError(error)) throw error;
 				logger.warn("HistoryStorage FTS rebuild failed", { error: String(error) });
 			}
 		}
@@ -348,12 +349,26 @@ ON CONFLICT(prompt) DO UPDATE SET
 					database => {
 						this.#initialize(database);
 						const pending = readPendingSalvage(this.#dbPath);
-						if (pending) this.#salvageFrom(pending.backupPath);
+						const live = pending.length ? sqliteFileIdentity(this.#dbPath) : undefined;
+						if (pending.length && typeof live !== "string")
+							throw new Error("Could not identify the history recovery target");
+						// A newer snapshot carries the ledger of older committed backups.
+						// Do not replay older entries until that ledger has been restored.
+						for (let i = pending.length - 1; i >= 0; i--) {
+							const backupPath = path.join(path.dirname(this.#dbPath), pending[i].backupName);
+							// A failed unlink can leave the source live in an already-open
+							// peer. Its snapshot is redundant, not another submission.
+							if (pending[i].sourceIdentity === live) {
+								clearPendingSalvage(this.#dbPath, backupPath);
+								continue;
+							}
+							if (!this.#salvageFrom(backupPath)) break;
+						}
 						return database;
 					},
 					{
 						recoverCorruption: true,
-						onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath, true),
+						onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath),
 					},
 				);
 				try {
@@ -475,6 +490,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 				safeLimit,
 			) as HistoryRow[];
 		} catch (error) {
+			if (isSqliteCorruptionError(error)) throw error;
 			// Malformed FTS expression - fall through to substring path.
 			logger.debug("HistoryStorage FTS query failed, using substring only", { error: String(error) });
 		}
@@ -486,6 +502,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 		try {
 			subRows = this.#searchSubstring(tokens, safeLimit, filter);
 		} catch (error) {
+			if (isSqliteCorruptionError(error)) throw error;
 			logger.error("HistoryStorage substring search failed", { error: String(error) });
 		}
 
@@ -634,43 +651,94 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 * The durable pointer survives scanning, transaction failure, and a crash
 	 * after COMMIT; the ledger makes a replay after COMMIT a no-op.
 	 */
-	#salvageFrom(backupPath: string): void {
+	#salvageFrom(backupPath: string): boolean {
 		let source: Database | undefined;
 		try {
-			recordPendingSalvage(this.#dbPath, backupPath);
+			this.#db.run("PRAGMA synchronous=FULL");
 			this.#db.run("CREATE TABLE IF NOT EXISTS history_salvage_applied (backup_path TEXT PRIMARY KEY)");
+			const backupName = path.basename(backupPath);
 			const applied = this.#db.query("SELECT 1 FROM history_salvage_applied WHERE backup_path = ?");
-			if (applied.get(backupPath)) {
+			if (applied.get(backupName)) {
 				clearPendingSalvage(this.#dbPath, backupPath);
-				return;
+				return true;
 			}
-			source = new Database(backupPath, { readonly: true });
-			const highWater = readHistorySequence(source);
-			const { rows, damagedRegions } = readDamagedSqliteRows<HistoryRow>(
-				source,
-				"history",
-				historyRowColumns(source),
-				wellFormedRowClause(""),
-			);
-			const salvaged = collapseByPrompt(rows);
-			const backup = source;
+			const sourceErrors: string[] = [];
+			const readSource = <T>(read: () => T, fallback: T): T => {
+				try {
+					return read();
+				} catch (error) {
+					if (
+						!isSqliteCorruptionError(error) &&
+						!isEnoent(error) &&
+						!(
+							error instanceof Error &&
+							(("code" in error && error.code === "SQLITE_ERROR") || ("errno" in error && error.errno === 1))
+						)
+					)
+						throw error;
+					sourceErrors.push(String(error));
+					return fallback;
+				}
+			};
+			source = readSource(() => {
+				fs.statSync(backupPath);
+				return new Database(backupPath, { readonly: true });
+			}, undefined);
+			let highWater: string | null = null;
+			let history: { rows: HistoryRow[]; damagedRegions: number } = { rows: [], damagedRegions: 0 };
+			let index: SalvagedSessionIndex | undefined;
+			let carried: Array<{ backup_path: string }> = [];
+			if (source) {
+				const backup = source;
+				carried = readSource(() => {
+					if (!backup.query("SELECT 1 FROM sqlite_master WHERE name='history_salvage_applied'").get()) return [];
+					return readDamagedSqliteRows<{ backup_path: string }>(
+						backup,
+						"history_salvage_applied",
+						"backup_path",
+						"typeof(backup_path)='text'",
+					).rows;
+				}, []);
+				highWater = readSource(() => readHistorySequence(backup), null);
+				history = readSource(
+					() =>
+						readDamagedSqliteRows<HistoryRow>(
+							backup,
+							"history",
+							historyRowColumns(backup),
+							wellFormedRowClause(""),
+						),
+					history,
+				);
+				index = readSource(() => readSalvagedSessionIndex(backup), undefined);
+				source.close();
+				source = undefined;
+			}
+			const salvaged = collapseByPrompt(history.rows);
 			this.#db
 				.transaction(() => {
-					if (applied.get(backupPath)) return;
-					this.#insertRows(salvaged);
+					if (applied.get(backupName)) return;
 					restoreHistorySequence(this.#db, highWater);
-					salvageSessionIndex(backup, this.#db);
-					this.#db.query("INSERT INTO history_salvage_applied (backup_path) VALUES (?)").run(backupPath);
+					this.#insertRows(salvaged);
+					if (index) restoreSalvagedSessionIndex(index, this.#db);
+					const mark = this.#db.query("INSERT OR IGNORE INTO history_salvage_applied (backup_path) VALUES (?)");
+					for (const row of carried) mark.run(path.basename(row.backup_path));
+					mark.run(backupName);
 				})
 				.immediate();
 			clearPendingSalvage(this.#dbPath, backupPath);
 			logger.warn("HistoryStorage salvaged a corrupt store", {
 				backupPath,
 				salvaged: salvaged.length,
-				damagedRegions,
+				damagedRegions: history.damagedRegions,
+				sourceErrors,
 			});
+			return true;
 		} catch (error) {
+			// Source corruption was classified before touching the target.
+			if (isSqliteCorruptionError(error)) throw error;
 			logger.error("HistoryStorage salvage deferred", { backupPath, error: String(error) });
+			return false;
 		} finally {
 			source?.close();
 		}

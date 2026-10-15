@@ -1,7 +1,6 @@
-import { getHistoryDbPath } from "@oh-my-pi/pi-utils/dirs";
-import * as path from "node:path";
+import { getHistoryDbPath, normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "../sdk";
 import { DEFAULT_MAX_LINES, truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -16,6 +15,7 @@ import {
 	type SuffixMatchCache,
 } from "./read-path-resolution";
 import {
+	configureSqliteReadConnection,
 	executeReadQuery,
 	getRowByKey,
 	getRowByRowId,
@@ -209,19 +209,29 @@ export async function readSqlite(
 	};
 
 	try {
-		// Reads of the process-wide store must not hold a handle across an await
-		// while corruption recovery quarantines and replaces it: open synchronously
-		// inside the shared lease. Other databases keep the async opener (their WAL
-		// sidecar probe requires it) and the same close-before-return lifetime.
-		if (path.resolve(resolvedSqlitePath.absolutePath) === path.resolve(getHistoryDbPath())) {
-			return withSqliteStoreLease(resolvedSqlitePath.absolutePath, () => {
+		// Snapshot only while leased: arbitrary raw SQL must not hold the
+		// recovery lock long enough to make prompt persistence time out.
+		if (
+			normalizePathForComparison(resolvedSqlitePath.absolutePath, { allowMissing: true }) ===
+			normalizePathForComparison(getHistoryDbPath(), { allowMissing: true })
+		) {
+			const snapshot = withSqliteStoreLease(resolvedSqlitePath.absolutePath, () => {
 				const db = openSqliteReadConnectionSync(resolvedSqlitePath.absolutePath);
 				try {
-					return renderResult(db);
+					return db.serialize();
 				} finally {
 					db.close();
 				}
 			});
+			// A deserialized database has no WAL sidecars; keep the serialized
+			// pages but switch its file-format read/write versions to rollback mode.
+			snapshot[18] = snapshot[19] = 1;
+			const db = configureSqliteReadConnection(Database.deserialize(snapshot, { readonly: true, strict: true }));
+			try {
+				return renderResult(db);
+			} finally {
+				db.close();
+			}
 		}
 		const db = await openSqliteReadConnection(resolvedSqlitePath.absolutePath);
 		try {

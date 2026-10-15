@@ -28,6 +28,7 @@ import { Settings } from "../config/settings";
 import type { Setting } from "../config/registry";
 
 import { BLOB_HASH_RE, BLOB_STAGING_RE, blobStagingPath } from "../session/blob-store";
+import { hasPendingHistorySalvage } from "../session/history-storage";
 import { listSessionsReadOnly, type SessionInfo, type SessionStatus } from "../session/session-listing";
 import { parseTerminalBreadcrumb } from "../session/session-paths";
 import { readSessionHeaderId } from "../session/session-loader";
@@ -1083,6 +1084,9 @@ function tableExists(db: Database, table: string): boolean {
 function deleteHistoryRowsForSessions(dbPath: string, sessionIds: string[]): { deleted: number; ftsRebuilt: boolean } {
 	if (sessionIds.length === 0) return { deleted: 0, ftsRebuilt: false };
 	return withLeasedDatabase(dbPath, db => {
+		if (hasPendingHistorySalvage(dbPath)) {
+			throw new Error("History recovery is pending; history cleanup was deferred");
+		}
 		db.run("PRAGMA busy_timeout = 5000");
 		const hasHistory = tableExists(db, "history") && tableHasColumn(db, "history", "session_id");
 		const hasRecaps = tableExists(db, "session_recaps");

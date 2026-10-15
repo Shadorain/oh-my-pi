@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { tryAcquireFileLock } from "../src/file-lock";
+import { normalizePathForComparison } from "../src/dirs";
 import {
 	isSqliteCorruptionError,
 	onSqliteStoreQuarantine,
@@ -140,6 +142,96 @@ test("store leases serialize independent processes and close handles before rele
 		await first.exited;
 		if (second) await second.exited;
 	}
+});
+
+test.each(["file", "directory", "dangling"])(
+	"aliases share the recovery lease through a missing target: %s",
+	async kind => {
+		await using dir = await TempDir.create("@omp-sqlite-alias-");
+		const targetDir = dir.join("target");
+		fs.mkdirSync(targetDir);
+		const dbPath = path.join(targetDir, "store.db");
+		const alias = kind === "directory" ? dir.join("linked", "store.db") : dir.join("alias.db");
+		if (kind === "directory") fs.symlinkSync(targetDir, dir.join("linked"), "junction");
+		else fs.symlinkSync(dbPath, alias);
+		if (kind !== "dangling") new Database(dbPath).close();
+		const readyPath = dir.join("ready");
+		const releasePath = dir.join("release");
+		const scriptPath = dir.join("holder.ts");
+		const sqliteModule = pathToFileURL(path.join(import.meta.dir, "../src/sqlite.ts")).href;
+		await Bun.write(
+			scriptPath,
+			`import * as fs from "node:fs";
+import { withSqliteStoreLease } from ${JSON.stringify(sqliteModule)};
+withSqliteStoreLease(${JSON.stringify(alias)}, () => {
+	fs.writeFileSync(${JSON.stringify(readyPath)}, "ready");
+	while (!fs.existsSync(${JSON.stringify(releasePath)})) Bun.sleepSync(5);
+});
+`,
+		);
+		const child = Bun.spawn([process.execPath, scriptPath], { stdout: "ignore", stderr: "pipe" });
+		try {
+			await waitForFile(readyPath);
+			const lock = tryAcquireFileLock(`${normalizePathForComparison(dbPath, { allowMissing: true })}.recovery`);
+			try {
+				expect(lock).toBeNull();
+			} finally {
+				lock?.release();
+			}
+			await Bun.write(releasePath, "release");
+			expect(await child.exited).toBe(0);
+		} finally {
+			child.kill();
+			await child.exited;
+		}
+	},
+);
+
+test("quarantining through a file alias replaces the target without destroying the alias", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-alias-quarantine-");
+	const dbPath = dir.join("store.db");
+	const alias = dir.join("alias.db");
+	const evidence = await corruptSchemaPages(dbPath);
+	fs.symlinkSync(dbPath, alias);
+	const db = openSqliteDatabaseSync(
+		alias,
+		store => {
+			store.run("CREATE TABLE entries (value TEXT)");
+			store.run("INSERT INTO entries VALUES ('replacement')");
+			return store;
+		},
+		{ recoverCorruption: true },
+	);
+	db.close();
+	expect(fs.lstatSync(alias).isSymbolicLink()).toBe(true);
+	const check = new Database(dbPath);
+	try {
+		expect(check.query("SELECT value FROM entries").all()).toEqual([{ value: "replacement" }]);
+	} finally {
+		check.close();
+	}
+	const preserved = fs.readdirSync(dir.path()).find(name => name.startsWith("store.db.corrupt-"));
+	expect(preserved).toBeDefined();
+	expect(await fs.promises.readFile(dir.join(preserved!))).toEqual(evidence);
+});
+
+test("a failed evidence flush aborts quarantine before the original is removed", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-evidence-flush-");
+	const dbPath = dir.join("store.db");
+	const evidence = await corruptSchemaPages(dbPath);
+	const flush = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {
+		throw new Error("backup flush failed");
+	});
+	try {
+		expect(() =>
+			openSqliteDatabaseSync(dbPath, db => db.query("SELECT * FROM entries").all(), {
+				recoverCorruption: true,
+			}),
+		).toThrow("backup flush failed");
+	} finally {
+		flush.mockRestore();
+	}
+	expect(await fs.promises.readFile(dbPath)).toEqual(evidence);
 });
 
 test("failed asynchronous initialization releases and rolls back its write transaction", async () => {
