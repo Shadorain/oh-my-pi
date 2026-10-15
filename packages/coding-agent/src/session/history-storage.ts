@@ -5,6 +5,7 @@ import {
 	assertSqliteQuickCheck,
 	getHistoryDbPath,
 	isEnoent,
+	isSqliteBusyError,
 	isSqliteCorruptionError,
 	logger,
 	openSqliteDatabaseSync,
@@ -12,6 +13,7 @@ import {
 	resolveEquivalentPath,
 	sqliteFileIdentity,
 	withSqliteStoreLease,
+	type SqliteFileIdentity,
 } from "@oh-my-pi/pi-utils";
 import { writeFileAtomicallySync } from "../utils/atomic-file";
 import { readSalvagedSessionIndex, restoreSalvagedSessionIndex, type SalvagedSessionIndex } from "./session-index";
@@ -41,7 +43,8 @@ export interface HistoryFilter {
 }
 
 type HistoryRow = {
-	id: number;
+	/** Rowid bound as text so values above 2^53 stay exact through dedup and ordering. */
+	id: string;
 	prompt: string;
 	created_at: number;
 	cwd: string | null;
@@ -49,7 +52,7 @@ type HistoryRow = {
 	use_count: number;
 };
 
-type SalvagedHistoryRow = Omit<HistoryRow, "id"> & { id: string };
+type SalvagedHistoryRow = HistoryRow;
 
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
@@ -120,17 +123,57 @@ function collapseByPrompt(rows: Array<HistoryRow | SalvagedHistoryRow>): Salvage
 }
 
 /** Selects the canonical row columns, defaulting those that predate `session_id` and `use_count`. */
-function historyRowSelection(db: Database, losslessId = false): { columns: string; predicate: string } {
+function historyRowSelection(db: Database): { columns: string; predicate: string } {
 	const names = new Set(
 		(db.query("PRAGMA table_info(history)").all() as Array<{ name: string }>).map(col => col.name),
 	);
-	const id = losslessId ? "CAST(id AS TEXT) AS id" : "id";
-	const sessionId = names.has("session_id") ? "session_id" : "NULL AS session_id";
+	const cwd = names.has("cwd") ? "CASE WHEN typeof(cwd) = 'text' THEN cwd END AS cwd" : "NULL AS cwd";
+	const sessionId = names.has("session_id")
+		? "CASE WHEN typeof(session_id) = 'text' THEN session_id END AS session_id"
+		: "NULL AS session_id";
 	const useCount = names.has("use_count") ? "use_count" : "1 AS use_count";
 	return {
-		columns: `${id}, prompt, created_at, cwd, ${sessionId}, ${useCount}`,
+		columns: `CAST(id AS TEXT) AS id, prompt, created_at, ${cwd}, ${sessionId}, ${useCount}`,
 		predicate: `${wellFormedRowClause("")} AND typeof(${names.has("use_count") ? "use_count" : "1"}) = 'integer'`,
 	};
+}
+
+/**
+ * Canonical read columns for a store already at {@link HISTORY_TABLE_DDL}
+ * shape. `id` comes back as text so rowids above 2^53 survive as Map keys
+ * and sort keys, and optional provenance folds non-text values to NULL —
+ * {@link wellFormedRowClause} guards `prompt`/`created_at`/`use_count`, but
+ * a damaged record can still hold a BLOB in `cwd` or `session_id`.
+ */
+function liveRowColumns(table: string): string {
+	return (
+		`CAST(${table}id AS TEXT) AS id, ${table}prompt, ${table}created_at, ` +
+		`CASE WHEN typeof(${table}cwd) = 'text' THEN ${table}cwd END AS cwd, ` +
+		`CASE WHEN typeof(${table}session_id) = 'text' THEN ${table}session_id END AS session_id, ${table}use_count`
+	);
+}
+
+/** Compares rowids carried as decimal text without losing bits above 2^53. */
+function compareRowIds(a: string, b: string): number {
+	const left = BigInt(a);
+	const right = BigInt(b);
+	return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** The file under `this.#db` was replaced between its open and now (a peer quarantined it); retry on the replacement. */
+class HistoryStoreReplaced extends Error {}
+
+/** Backup contents plus the ledger rows it carries; scanned without the store lease. */
+interface HistorySalvageScan {
+	backupName: string;
+	/** Quarantined file's identity; matching the live file marks the backup redundant. */
+	sourceIdentity?: string;
+	highWater: string | null;
+	history: SalvagedHistoryRow[];
+	index?: SalvagedSessionIndex;
+	carried: string[];
+	damagedRegions: number;
+	sourceErrors: string[];
 }
 
 /** Keep the allocation high-water mark in SQLite's integer domain, including values above 2^53. */
@@ -312,10 +355,10 @@ END;
 			}
 		}
 		this.#recentStmt = this.#db.query(
-			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${wellFormedRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
+			`SELECT ${liveRowColumns("")} FROM history WHERE ${wellFormedRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
 		);
 		this.#searchStmt = this.#db.query(
-			`SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ?1 AND ${wellFormedRowClause("h.")} AND ${historyFilterClause("h.", 2)} ORDER BY h.created_at DESC, h.id DESC LIMIT ?4`,
+			`SELECT ${liveRowColumns("h.")} FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ?1 AND ${wellFormedRowClause("h.")} AND ${historyFilterClause("h.", 2)} ORDER BY h.created_at DESC, h.id DESC LIMIT ?4`,
 		);
 		this.#upsertRowStmt = this.#db.query(`
 INSERT INTO history (prompt, created_at, cwd, session_id)
@@ -352,28 +395,15 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	#withStore<T>(operation: () => T): T {
 		if (this.#closed) throw new Error("HistoryStorage is closed");
-		return withSqliteStoreLease(this.#dbPath, () => {
-			for (let attempt = 0; ; attempt++) {
+		for (let attempt = 0; ; attempt++) {
+			// The recovery lease serializes who may replace the store file; a lease
+			// for initialization is enough — walking an immutable backup under it
+			// blocks every other participant's open for the duration of the scan.
+			const opened = withSqliteStoreLease(this.#dbPath, () => {
 				const db = openSqliteDatabaseSync(
 					this.#dbPath,
 					database => {
 						this.#initialize(database);
-						const pending = readPendingSalvage(this.#dbPath);
-						const live = pending.length ? sqliteFileIdentity(this.#dbPath) : undefined;
-						if (pending.length && typeof live !== "string")
-							throw new Error("Could not identify the history recovery target");
-						// A newer snapshot carries the ledger of older committed backups.
-						// Do not replay older entries until that ledger has been restored.
-						for (let i = pending.length - 1; i >= 0; i--) {
-							const backupPath = path.join(path.dirname(this.#dbPath), pending[i].backupName);
-							// A failed unlink can leave the source live in an already-open
-							// peer. Its snapshot is redundant, not another submission.
-							if (pending[i].sourceIdentity === live) {
-								clearPendingSalvage(this.#dbPath, backupPath);
-								continue;
-							}
-							if (!this.#salvageFrom(backupPath)) break;
-						}
 						return database;
 					},
 					{
@@ -381,21 +411,73 @@ ON CONFLICT(prompt) DO UPDATE SET
 						onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath),
 					},
 				);
-				try {
+				// Identity of the file this handle actually opened, after open()
+				// created it; pre-open stat reports `null` for a fresh store.
+				return { identity: sqliteFileIdentity(this.#dbPath), db };
+			});
+			try {
+				const scans = this.#scanPendingSalvage(opened.identity);
+				return withSqliteStoreLease(this.#dbPath, () => {
+					const live = sqliteFileIdentity(this.#dbPath);
+					// A peer quarantined the store while backups were scanned: writes
+					// would land on an unlinked inode. Reopen against the replacement.
+					if (live !== undefined && live !== opened.identity) throw new HistoryStoreReplaced();
+					for (const scan of scans) {
+						try {
+							this.#applySalvageScan(scan);
+						} catch (error) {
+							// A peer holding the write lock defers the insert, same as a
+							// failed scan: the journal entry stays for the next open.
+							if (!isSqliteBusyError(error)) throw error;
+							logger.error("HistoryStorage salvage deferred", {
+								backupPath: scan.backupName,
+								error: String(error),
+							});
+							break;
+						}
+					}
 					return operation();
-				} catch (error) {
-					// The open-time check is generation-gated, so damage done after
-					// that scan first surfaces as an operation error. Invalidate the
-					// generation proof and retry once: the re-scan recovers a corrupt
-					// store through the same path an open-time failure does.
-					if (attempt > 0 || !isSqliteCorruptionError(error)) throw error;
-					this.#checkedIdentity = undefined;
-				} finally {
-					this.#substringStmts.clear();
-					db.close();
-				}
+				});
+			} catch (error) {
+				// The open-time check is generation-gated, so damage done after
+				// that scan first surfaces as an operation error. Invalidate the
+				// generation proof and retry once: the re-scan recovers a corrupt
+				// store through the same path an open-time failure does.
+				if (attempt > 0 || (!isSqliteCorruptionError(error) && !(error instanceof HistoryStoreReplaced)))
+					throw error;
+				this.#checkedIdentity = undefined;
+			} finally {
+				this.#substringStmts.clear();
+				opened.db.close();
 			}
-		});
+		}
+	}
+
+	/**
+	 * Reads the pending-salvage journal and snapshots each recoverable backup,
+	 * newest first, until one defers. No lease and no live-database access: the
+	 * scans hold only read handles on immutable quarantined files, so a large
+	 * damaged backup cannot serialize the store's other participants.
+	 */
+	#scanPendingSalvage(identity: SqliteFileIdentity): HistorySalvageScan[] {
+		const pending = readPendingSalvage(this.#dbPath);
+		if (pending.length === 0) return [];
+		if (typeof identity !== "string") throw new Error("Could not identify the history recovery target");
+		const scans: HistorySalvageScan[] = [];
+		// A newer snapshot carries the ledger of older committed backups.
+		// Do not replay older entries until that ledger has been restored.
+		for (let i = pending.length - 1; i >= 0; i--) {
+			// A failed unlink can leave the source live in an already-open peer.
+			// Its snapshot is redundant, not another submission.
+			if (pending[i].sourceIdentity === identity) {
+				clearPendingSalvage(this.#dbPath, pending[i].backupName);
+				continue;
+			}
+			const scan = this.#scanBackup(path.join(path.dirname(this.#dbPath), pending[i].backupName));
+			if (!scan) break;
+			scans.push(scan);
+		}
+		return scans;
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>): void {
@@ -520,7 +602,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			return subRows.map(row => this.#toEntry(row));
 		}
 
-		const rowsById = new Map<number, HistoryRow>();
+		const rowsById = new Map<string, HistoryRow>();
 		for (const row of ftsRows) {
 			rowsById.set(row.id, row);
 		}
@@ -529,7 +611,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 		}
 
 		return [...rowsById.values()]
-			.sort((a, b) => b.created_at - a.created_at || b.id - a.id)
+			.sort((a, b) => b.created_at - a.created_at || compareRowIds(b.id, a.id))
 			.slice(0, safeLimit)
 			.map(row => this.#toEntry(row));
 	}
@@ -601,7 +683,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 				const highWater = readHistorySequence(this.#db);
 				let rows: SalvagedHistoryRow[];
 				try {
-					const { columns, predicate } = historyRowSelection(this.#db, true);
+					const { columns, predicate } = historyRowSelection(this.#db);
 					rows = this.#db.query(`SELECT ${columns} FROM history WHERE ${predicate}`).all() as SalvagedHistoryRow[];
 				} catch (error) {
 					if (isSqliteCorruptionError(error)) throw error;
@@ -656,21 +738,14 @@ ON CONFLICT(prompt) DO UPDATE SET
 	}
 
 	/**
-	 * Prompts, index rows, and the applied-backup identity commit together.
-	 * The durable pointer survives scanning, transaction failure, and a crash
-	 * after COMMIT; the ledger makes a replay after COMMIT a no-op.
+	 * Snapshots one immutable quarantined backup. Holds only a read handle on
+	 * the backup itself — never the store lease — so the scan can outlast a
+	 * damaged b-tree walk without serializing other participants. Returns
+	 * `undefined` when the backup cannot be read at all (it stays journaled).
 	 */
-	#salvageFrom(backupPath: string): boolean {
+	#scanBackup(backupPath: string): HistorySalvageScan | undefined {
 		let source: Database | undefined;
 		try {
-			this.#db.run("PRAGMA synchronous=FULL");
-			this.#db.run("CREATE TABLE IF NOT EXISTS history_salvage_applied (backup_path TEXT PRIMARY KEY)");
-			const backupName = path.basename(backupPath);
-			const applied = this.#db.query("SELECT 1 FROM history_salvage_applied WHERE backup_path = ?");
-			if (applied.get(backupName)) {
-				clearPendingSalvage(this.#dbPath, backupPath);
-				return true;
-			}
 			const sourceErrors: string[] = [];
 			const readSource = <T>(read: () => T, fallback: T): T => {
 				try {
@@ -693,58 +768,84 @@ ON CONFLICT(prompt) DO UPDATE SET
 				fs.statSync(backupPath);
 				return new Database(backupPath, { readonly: true });
 			}, undefined);
-			let highWater: string | null = null;
-			let history: { rows: SalvagedHistoryRow[]; damagedRegions: number } = { rows: [], damagedRegions: 0 };
-			let index: SalvagedSessionIndex | undefined;
-			let carried: Array<{ backup_path: string }> = [];
-			if (source) {
-				const backup = source;
-				carried = readSource(() => {
-					if (!backup.query("SELECT 1 FROM sqlite_master WHERE name='history_salvage_applied'").get()) return [];
-					return readDamagedSqliteRows<{ backup_path: string }>(
-						backup,
-						"history_salvage_applied",
-						"backup_path",
-						"typeof(backup_path)='text'",
-					).rows;
-				}, []);
-				highWater = readSource(() => readHistorySequence(backup), null);
-				history = readSource(() => {
-					const { columns, predicate } = historyRowSelection(backup, true);
+			if (!source)
+				return {
+					backupName: path.basename(backupPath),
+					highWater: null,
+					history: [],
+					carried: [],
+					damagedRegions: 0,
+					sourceErrors,
+				};
+			const backup = source;
+			const carried = readSource(() => {
+				if (!backup.query("SELECT 1 FROM sqlite_master WHERE name='history_salvage_applied'").get()) return [];
+				return readDamagedSqliteRows<{ backup_path: string }>(
+					backup,
+					"history_salvage_applied",
+					"backup_path",
+					"typeof(backup_path)='text'",
+				).rows;
+			}, []);
+			const highWater = readSource(() => readHistorySequence(backup), null);
+			const history = readSource(
+				() => {
+					const { columns, predicate } = historyRowSelection(backup);
 					return readDamagedSqliteRows<SalvagedHistoryRow>(backup, "history", columns, predicate);
-				}, history);
-				index = readSource(() => readSalvagedSessionIndex(backup), undefined);
-				source.close();
-				source = undefined;
-			}
-			const salvaged = collapseByPrompt(history.rows);
-			this.#db
-				.transaction(() => {
-					if (applied.get(backupName)) return;
-					restoreHistorySequence(this.#db, highWater);
-					this.#insertRows(salvaged);
-					if (index) restoreSalvagedSessionIndex(index, this.#db);
-					const mark = this.#db.query("INSERT OR IGNORE INTO history_salvage_applied (backup_path) VALUES (?)");
-					for (const row of carried) mark.run(path.basename(row.backup_path));
-					mark.run(backupName);
-				})
-				.immediate();
-			clearPendingSalvage(this.#dbPath, backupPath);
-			logger.warn("HistoryStorage salvaged a corrupt store", {
-				backupPath,
-				salvaged: salvaged.length,
-				damagedRegions: history.damagedRegions,
+				},
+				{ rows: [], damagedRegions: 0 },
+			);
+			const index = readSource(() => readSalvagedSessionIndex(backup), undefined);
+			source.close();
+			source = undefined;
+			return {
+				backupName: path.basename(backupPath),
+				highWater,
+				history: collapseByPrompt(history.rows),
+				index,
+				carried: carried.map(row => path.basename(row.backup_path)),
+				damagedRegions: history.damagedRegions + (index?.damagedRegions ?? 0),
 				sourceErrors,
-			});
-			return true;
+			};
 		} catch (error) {
-			// Source corruption was classified before touching the target.
-			if (isSqliteCorruptionError(error)) throw error;
 			logger.error("HistoryStorage salvage deferred", { backupPath, error: String(error) });
-			return false;
+			return undefined;
 		} finally {
 			source?.close();
 		}
+	}
+
+	/**
+	 * Applies one scanned backup. Rows, provenance index rows, and the
+	 * applied-backup identity commit together; the durable journal entry is
+	 * cleared afterwards. The ledger makes a replay after COMMIT a no-op.
+	 */
+	#applySalvageScan(scan: HistorySalvageScan): void {
+		this.#db.run("PRAGMA synchronous=FULL");
+		this.#db.run("CREATE TABLE IF NOT EXISTS history_salvage_applied (backup_path TEXT PRIMARY KEY)");
+		const applied = this.#db.query("SELECT 1 FROM history_salvage_applied WHERE backup_path = ?");
+		if (applied.get(scan.backupName)) {
+			clearPendingSalvage(this.#dbPath, scan.backupName);
+			return;
+		}
+		this.#db
+			.transaction(() => {
+				if (applied.get(scan.backupName)) return;
+				restoreHistorySequence(this.#db, scan.highWater);
+				this.#insertRows(scan.history);
+				if (scan.index) restoreSalvagedSessionIndex(scan.index, this.#db);
+				const mark = this.#db.query("INSERT OR IGNORE INTO history_salvage_applied (backup_path) VALUES (?)");
+				for (const name of scan.carried) mark.run(name);
+				mark.run(scan.backupName);
+			})
+			.immediate();
+		clearPendingSalvage(this.#dbPath, scan.backupName);
+		logger.warn("HistoryStorage salvaged a corrupt store", {
+			backupPath: path.join(path.dirname(this.#dbPath), scan.backupName),
+			salvaged: scan.history.length,
+			damagedRegions: scan.damagedRegions,
+			sourceErrors: scan.sourceErrors,
+		});
 	}
 
 	#normalizeLimit(limit: number): number {
@@ -783,7 +884,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 			" AND ",
 		);
 		stmt = this.#db.query(
-			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?${tokenCount + 3}`,
+			`SELECT ${liveRowColumns("")} FROM history WHERE ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?${tokenCount + 3}`,
 		);
 		this.#substringStmts.set(tokenCount, stmt);
 		return stmt;
@@ -791,7 +892,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	#toEntry(row: HistoryRow): HistoryEntry {
 		return {
-			id: row.id,
+			id: Number(row.id),
 			prompt: row.prompt,
 			created_at: row.created_at,
 			cwd: row.cwd ?? undefined,

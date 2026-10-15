@@ -1059,3 +1059,105 @@ it("does not replay a queued snapshot into the original generation that is still
 	]);
 	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
 });
+
+it("returns distinct search hits when adjacent rowids round to the same JavaScript number", async () => {
+	tempDir = TempDir.createSync("@omp-history-wide-search-");
+	const dbPath = tempDir.join("history.db");
+	await HistoryStorage.open(dbPath).add("seed");
+	HistoryStorage.close();
+	const raw = new Database(dbPath);
+	raw.run("UPDATE sqlite_sequence SET seq=9007199254740991 WHERE name='history'");
+	raw.close();
+	// Rows 9007199254740992 and ...993 are distinct rowids that coerce to the
+	// same IEEE-754 double; a numeric key would collapse one of them.
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("wide alpha");
+	await storage.add("wide beta");
+	expect(
+		storage
+			.search("wide", 10)
+			.map(entry => entry.prompt)
+			.sort(),
+	).toEqual(["wide alpha", "wide beta"]);
+});
+
+it("reads damaged rows above the safe integer range without collapsing their ids", async () => {
+	tempDir = TempDir.createSync("@omp-history-wide-dedup-");
+	const dbPath = tempDir.join("history.db");
+	const raw = new Database(dbPath);
+	raw.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY, prompt TEXT, created_at INTEGER,
+			cwd TEXT, session_id TEXT, use_count INTEGER
+		);
+		INSERT INTO history VALUES
+			(9007199254740992, 'wide alpha', 1, NULL, NULL, 1),
+			(9007199254740993, 'wide beta', 2, NULL, NULL, 1);
+		PRAGMA user_version = 1;
+	`);
+	raw.close();
+	// Rebuild folds through text rowids; both prompts must survive intact.
+	const storage = HistoryStorage.open(dbPath);
+	expect(
+		storage
+			.getRecent(10)
+			.map(entry => entry.prompt)
+			.sort(),
+	).toEqual(["wide alpha", "wide beta"]);
+	expect(
+		storage
+			.search("wide", 10)
+			.map(entry => entry.prompt)
+			.sort(),
+	).toEqual(["wide alpha", "wide beta"]);
+});
+
+it("drops non-text provenance from a damaged backup while keeping the prompt", async () => {
+	tempDir = TempDir.createSync("@omp-history-salvage-provenance-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	const backup = new Database(backupPath);
+	backup.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY, prompt TEXT, created_at INTEGER,
+			cwd TEXT, session_id TEXT, use_count INTEGER
+		);
+		INSERT INTO history VALUES (1, 'recovered prompt', 1, X'0102', X'0304', 1);
+	`);
+	backup.close();
+	queueBackup(dbPath, backupPath);
+
+	const storage = HistoryStorage.open(dbPath);
+	const [entry] = storage.getRecent(10);
+	expect(entry?.prompt).toBe("recovered prompt");
+	expect(entry?.cwd).toBeUndefined();
+	expect(entry?.sessionId).toBeUndefined();
+	const [found] = storage.search("recovered", 10);
+	expect(found?.cwd).toBeUndefined();
+	expect(found?.sessionId).toBeUndefined();
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
+it("does not hold the recovery lease while scanning a queued backup", async () => {
+	tempDir = TempDir.createSync("@omp-history-salvage-lease-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	seedSalvageBackup(backupPath);
+	queueBackup(dbPath, backupPath);
+
+	const realScan = utils.readDamagedSqliteRows;
+	let leaseHeldDuringScan: boolean | undefined;
+	vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation(((db: Database, table: string, columns: string) => {
+		if (table === "history") {
+			const lease = utils.tryAcquireFileLock(
+				`${utils.normalizePathForComparison(dbPath, { allowMissing: true })}.recovery`,
+			);
+			leaseHeldDuringScan = lease === null;
+			lease?.release();
+		}
+		return realScan(db, table, columns);
+	}) as typeof utils.readDamagedSqliteRows);
+
+	HistoryStorage.open(dbPath);
+	expect(leaseHeldDuringScan).toBe(false);
+});

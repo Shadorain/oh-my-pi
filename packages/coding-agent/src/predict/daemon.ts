@@ -70,16 +70,11 @@ function parseHistoryCursorId(value: unknown): string {
 export async function readCursor(stateDir: string): Promise<HistoryCursor | undefined> {
 	try {
 		const raw: unknown = await Bun.file(path.join(stateDir, CURSOR_FILE)).json();
-		const historyId =
-			typeof raw === "object" && raw !== null && "historyId" in raw
-				? parseHistoryCursorId(raw.historyId)
-				: undefined;
+		const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : null;
+		const historyId = record ? parseHistoryCursorId(record.historyId) : undefined;
 		if (historyId !== undefined) {
-			return {
-				historyId,
-				historyIdentity:
-					"historyIdentity" in raw && typeof raw.historyIdentity === "string" ? raw.historyIdentity : undefined,
-			};
+			const identity = record?.historyIdentity;
+			return { historyId, historyIdentity: typeof identity === "string" ? identity : undefined };
 		}
 		return { historyId: "0" };
 	} catch (error) {

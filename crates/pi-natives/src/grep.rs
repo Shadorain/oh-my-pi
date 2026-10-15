@@ -2355,8 +2355,8 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			});
 		}
 
-		// A single explicit file is one file, so `max_count_per_file` applies to it
-		// exactly as it does inside a directory walk.
+		// A single explicit file is one file, so `max_count_per_file` applies to
+		// it exactly as it does inside a directory walk.
 		let params = single_file_params(params);
 		let path_string = search_path.to_string_lossy().into_owned();
 		let search = match stream {
@@ -3470,11 +3470,12 @@ mod tests {
 		assert_eq!(result.matches[0].match_count, Some(2));
 	}
 
-	/// A single-file Count search reports every match, as a directory search does.
+	/// A single-file Count search reports every match, as a directory search
+	/// does.
 	///
 	/// The direct-file branch once passed the caller's `max_count` to
-	/// `MatchCollector`, so `grep({ path: file, mode: Count, maxCount: 2 })` on a
-	/// file with 5 matches stopped at the third match and reported
+	/// `MatchCollector`, so `grep({ path: file, mode: Count, maxCount: 2 })` on
+	/// a file with 5 matches stopped at the third match and reported
 	/// `matchCount: 3`, the max+1 value from the early `Ok(false)`.
 	///
 	/// Self-contained on purpose: the shared `write_file` and `base_grep_config`

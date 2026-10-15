@@ -2745,7 +2745,8 @@ export function convertMessages(
 			) {
 				const reasoningField = compat.reasoningContentField ?? "reasoning_content";
 				assistantMsg[reasoningField] = demotedReasoningParts.join("\n");
-				assistantMsg.content = contentWithoutDemoted && contentWithoutDemoted.length > 0 ? contentWithoutDemoted : null;
+				assistantMsg.content =
+					contentWithoutDemoted && contentWithoutDemoted.length > 0 ? contentWithoutDemoted : null;
 				hasReasoningField = true;
 			}
 			// Some OpenAI-compatible backends concatenate assistant content as a
