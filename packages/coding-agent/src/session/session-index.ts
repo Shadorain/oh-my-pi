@@ -25,7 +25,7 @@ import * as path from "node:path";
 import { getHistoryDbPath } from "@oh-my-pi/pi-utils/dirs";
 import { getDbBusyTimeoutMs } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
-import { onSqliteStoreQuarantine, readDamagedSqliteRows } from "@oh-my-pi/pi-utils/sqlite";
+import { onSqliteStoreQuarantine, readDamagedSqliteRows, withSqliteStoreLease } from "@oh-my-pi/pi-utils/sqlite";
 
 const SESSION_INDEX_DDL = `
 CREATE TABLE IF NOT EXISTS session_titles (
@@ -44,70 +44,64 @@ CREATE INDEX IF NOT EXISTS idx_session_recaps_session ON session_recaps(session_
 `;
 
 interface SessionIndexHandle {
-	dbPath: string;
 	db: Database;
 	upsertTitle: Statement;
 	selectTitle: Statement;
 	insertRecap: Statement;
-	unregisterQuarantine: () => void;
 }
 
-let handle: SessionIndexHandle | undefined;
-/** Db path whose open failed; skip retries (and log spam) until the path changes. */
+/** Db path whose open failed; skip retries until that path's file identity changes. */
 let failedPath: string | undefined;
+let failedIdentity: string | null | undefined;
 /** One quarantine-clearing hook per {@link failedPath}; self-unregisters once it fires. */
 let failedPathUnregister: (() => void) | undefined;
 
-function closeHandle(): void {
-	if (!handle) return;
-	handle.unregisterQuarantine();
+function sessionIndexFileIdentity(dbPath: string): string | null | undefined {
 	try {
-		handle.upsertTitle.finalize();
-		handle.selectTitle.finalize();
-		handle.insertRecap.finalize();
-		handle.db.close();
-	} catch {}
-	handle = undefined;
+		const stat = fs.statSync(dbPath);
+		return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return null;
+		return undefined;
+	}
 }
 
-function openSessionIndex(): SessionIndexHandle | undefined {
+function withSessionIndex<T>(operation: (index: SessionIndexHandle) => T): T | undefined {
 	const dbPath = getHistoryDbPath();
-	if (handle?.dbPath === dbPath) return handle;
-	if (failedPath === dbPath) return undefined;
-	closeHandle();
-	let db: Database | undefined;
-	try {
-		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-		db = new Database(dbPath);
-		// Install the busy handler BEFORE any lock-taking statement (see #2421).
-		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
-		db.run(`PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n${SESSION_INDEX_DDL}`);
-		const ready = db;
-		// Statements are finalized individually before the catch's close(): an
-		// unfinalized statement defers the OS close, and Windows then refuses to
-		// unlink the store when HistoryStorage quarantines it (see gc-cli.ts).
+	return withSqliteStoreLease(dbPath, () => {
+		if (failedPath === dbPath) {
+			const currentIdentity = sessionIndexFileIdentity(dbPath);
+			if (currentIdentity === undefined || currentIdentity === failedIdentity) return undefined;
+			failedPath = undefined;
+			failedIdentity = undefined;
+			failedPathUnregister?.();
+			failedPathUnregister = undefined;
+		}
+		let db: Database | undefined;
 		const prepared: Statement[] = [];
+		let index: SessionIndexHandle;
 		try {
+			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+			db = new Database(dbPath);
+			// Install the busy handler BEFORE any lock-taking statement (see #2421).
+			db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+			db.run(`PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;\n${SESSION_INDEX_DDL}`);
 			prepared.push(
-				ready.prepare(`
+				db.prepare(`
 INSERT INTO session_titles (session_id, title, updated_at)
 VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER))
 ON CONFLICT(session_id) DO UPDATE SET
 	title = excluded.title,
 	updated_at = excluded.updated_at
 				`),
-				ready.prepare("SELECT title FROM session_titles WHERE session_id = ?"),
-				ready.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"),
 			);
-			handle = {
-				dbPath,
-				db: ready,
+			prepared.push(db.prepare("SELECT title FROM session_titles WHERE session_id = ?"));
+			prepared.push(db.prepare("INSERT INTO session_recaps (session_id, cwd, recap) VALUES (?, ?, ?)"));
+			index = {
+				db,
 				upsertTitle: prepared[0],
 				selectTitle: prepared[1],
 				insertRecap: prepared[2],
-				// HistoryStorage may quarantine this file on corruption; drop the handle so the next
-				// call reopens the replacement (and Windows can unlink the original).
-				unregisterQuarantine: onSqliteStoreQuarantine(dbPath, closeHandle),
 			};
 		} catch (error) {
 			for (const stmt of prepared) {
@@ -115,27 +109,38 @@ ON CONFLICT(session_id) DO UPDATE SET
 					stmt.finalize();
 				} catch {}
 			}
-			throw error;
+			db?.close();
+			failedPath = dbPath;
+			failedIdentity = sessionIndexFileIdentity(dbPath);
+			if (failedPathUnregister) failedPathUnregister();
+			const hook = onSqliteStoreQuarantine(dbPath, () => {
+				if (failedPath === dbPath) {
+					failedPath = undefined;
+					failedIdentity = undefined;
+				}
+				failedPathUnregister = undefined;
+				hook();
+			});
+			failedPathUnregister = hook;
+			logger.warn("Session index unavailable", { dbPath, error: String(error) });
+			return undefined;
 		}
-		// Published: the catch must not close `db` anymore — closeHandle owns it.
-		db = undefined;
+
 		failedPath = undefined;
-		return handle;
-	} catch (error) {
-		failedPath = dbPath;
-		// A failed open must not pin the file: quarantine needs to unlink it (Windows),
-		// and the latch clears once a quarantined store is replaced.
-		db?.close();
-		if (failedPathUnregister) failedPathUnregister();
-		const hook = onSqliteStoreQuarantine(dbPath, () => {
-			if (failedPath === dbPath) failedPath = undefined;
-			failedPathUnregister = undefined;
-			hook();
-		});
-		failedPathUnregister = hook;
-		logger.warn("Session index unavailable", { dbPath, error: String(error) });
-		return undefined;
-	}
+		failedIdentity = undefined;
+		failedPathUnregister?.();
+		failedPathUnregister = undefined;
+		try {
+			return operation(index);
+		} finally {
+			for (const stmt of prepared) {
+				try {
+					stmt.finalize();
+				} catch {}
+			}
+			db.close();
+		}
+	});
 }
 
 /**
@@ -143,10 +148,8 @@ ON CONFLICT(session_id) DO UPDATE SET
  * failures must never break a rename, so errors are logged and swallowed.
  */
 export function recordSessionTitle(sessionId: string, title: string): void {
-	const index = openSessionIndex();
-	if (!index) return;
 	try {
-		index.upsertTitle.run(sessionId, title);
+		withSessionIndex(index => index.upsertTitle.run(sessionId, title));
 	} catch (error) {
 		logger.debug("Session title index write failed", { sessionId, error: String(error) });
 	}
@@ -154,11 +157,11 @@ export function recordSessionTitle(sessionId: string, title: string): void {
 
 /** Indexed title for a session id, or undefined when unindexed/unavailable. */
 export function lookupSessionTitle(sessionId: string): string | undefined {
-	const index = openSessionIndex();
-	if (!index) return undefined;
 	try {
-		const row = index.selectTitle.get(sessionId) as { title: string } | null;
-		return row?.title ?? undefined;
+		return withSessionIndex(index => {
+			const row = index.selectTitle.get(sessionId) as { title: string } | null;
+			return row?.title ?? undefined;
+		});
 	} catch (error) {
 		logger.debug("Session title index read failed", { sessionId, error: String(error) });
 		return undefined;
@@ -170,10 +173,8 @@ export function lookupSessionTitle(sessionId: string): string | undefined {
  * failure must never disturb the recap display, so errors are logged and swallowed.
  */
 export function recordSessionRecap(sessionId: string, cwd: string, recap: string): void {
-	const index = openSessionIndex();
-	if (!index) return;
 	try {
-		index.insertRecap.run(sessionId, cwd, recap);
+		withSessionIndex(index => index.insertRecap.run(sessionId, cwd, recap));
 	} catch (error) {
 		logger.debug("Session recap journal write failed", { sessionId, error: String(error) });
 	}
@@ -212,8 +213,6 @@ interface SessionRecapRow {
  */
 export function listSessionRecaps(query: SessionRecapQuery = {}): SessionRecap[] {
 	if (query.sessionIds?.length === 0) return [];
-	const index = openSessionIndex();
-	if (!index) return [];
 	const where: string[] = [];
 	const params: SQLQueryBindings[] = [];
 	if (query.sessionIds) {
@@ -232,15 +231,18 @@ export function listSessionRecaps(query: SessionRecapQuery = {}): SessionRecap[]
 		params.push(query.limit);
 	}
 	try {
-		// Ad-hoc SQL (the IN list varies), so prepare and finalize per call
-		// instead of growing the connection's statement cache.
-		using statement = index.db.prepare(sql);
-		return (statement.all(...params) as SessionRecapRow[]).map(row => ({
-			sessionId: row.session_id,
-			cwd: row.cwd,
-			recap: row.recap,
-			createdAt: row.created_at,
-		}));
+		return (
+			withSessionIndex(index => {
+				// Ad-hoc SQL (the IN list varies), so prepare and finalize per call.
+				using statement = index.db.prepare(sql);
+				return (statement.all(...params) as SessionRecapRow[]).map(row => ({
+					sessionId: row.session_id,
+					cwd: row.cwd,
+					recap: row.recap,
+					createdAt: row.created_at,
+				}));
+			}) ?? []
+		);
 	} catch (error) {
 		logger.debug("Session recap journal read failed", { error: String(error) });
 		return [];
@@ -261,31 +263,31 @@ interface SalvagedRecapRow extends SessionRecapRow {
  * Copies the readable session-index rows of a quarantined history.db into its
  * replacement. A peer process may already have written there: a title keeps
  * the newer of the two, and a recap whose id is taken gets a fresh one.
- * Best-effort like the writers: failures are logged.
+ * Target failures propagate so the caller can roll back its salvage transaction.
  */
 export function salvageSessionIndex(source: Database, target: Database): void {
-	try {
-		const tables = new Set(
-			(source.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
-				row => row.name,
-			),
-		);
-		const titles = tables.has("session_titles")
-			? readDamagedSqliteRows<SessionTitleRow>(
-					source,
-					"session_titles",
-					"session_id, title, updated_at",
-					"typeof(session_id) = 'text' AND typeof(title) = 'text' AND typeof(updated_at) = 'integer'",
-				)
-			: { rows: [], damagedRegions: 0 };
-		const recaps = tables.has("session_recaps")
-			? readDamagedSqliteRows<SalvagedRecapRow>(
-					source,
-					"session_recaps",
-					"id, session_id, cwd, recap, created_at",
-					"typeof(session_id) = 'text' AND typeof(cwd) = 'text' AND typeof(recap) = 'text' AND typeof(created_at) = 'integer'",
-				)
-			: { rows: [], damagedRegions: 0 };
+	const tables = new Set(
+		(source.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+			row => row.name,
+		),
+	);
+	const titles = tables.has("session_titles")
+		? readDamagedSqliteRows<SessionTitleRow>(
+				source,
+				"session_titles",
+				"session_id, title, updated_at",
+				"typeof(session_id) = 'text' AND typeof(title) = 'text' AND typeof(updated_at) = 'integer'",
+			)
+		: { rows: [], damagedRegions: 0 };
+	const recaps = tables.has("session_recaps")
+		? readDamagedSqliteRows<SalvagedRecapRow>(
+				source,
+				"session_recaps",
+				"id, session_id, cwd, recap, created_at",
+				"typeof(session_id) = 'text' AND typeof(cwd) = 'text' AND typeof(recap) = 'text' AND typeof(created_at) = 'integer'",
+			)
+		: { rows: [], damagedRegions: 0 };
+	target.transaction(() => {
 		target.run(SESSION_INDEX_DDL);
 		const insertTitle = target.query(`
 INSERT INTO session_titles (session_id, title, updated_at) VALUES (?, ?, ?)
@@ -296,24 +298,20 @@ WHERE excluded.updated_at > session_titles.updated_at
 INSERT INTO session_recaps (id, session_id, cwd, recap, created_at)
 VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5)
 		`);
-		target.transaction(() => {
-			for (const row of titles.rows) insertTitle.run(row.session_id, row.title, row.updated_at);
-			for (const row of recaps.rows) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);
-		})();
-		logger.warn("Session index salvaged from a corrupt history store", {
-			titles: titles.rows.length,
-			recaps: recaps.rows.length,
-			damagedRegions: titles.damagedRegions + recaps.damagedRegions,
-		});
-	} catch (error) {
-		logger.error("Session index salvage failed", { error: String(error) });
-	}
+		for (const row of titles.rows) insertTitle.run(row.session_id, row.title, row.updated_at);
+		for (const row of recaps.rows) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);
+	})();
+	logger.warn("Session index salvaged from a corrupt history store", {
+		titles: titles.rows.length,
+		recaps: recaps.rows.length,
+		damagedRegions: titles.damagedRegions + recaps.damagedRegions,
+	});
 }
 
-/** @internal Close the cached connection so the next call re-resolves the db path — test-only. */
+/** @internal Clear cached availability state — test-only. */
 export function resetSessionIndexForTests(): void {
-	closeHandle();
 	failedPath = undefined;
+	failedIdentity = undefined;
 	failedPathUnregister?.();
 	failedPathUnregister = undefined;
 }

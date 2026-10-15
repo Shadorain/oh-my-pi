@@ -623,5 +623,7 @@ Discovery helpers live in `session-listing.ts`; `SessionManager` exposes project
 - Resubmission updates the latest timestamp/cwd/session provenance and increments `use_count`
 - `add()` writes synchronously before returning its resolved promise; failures are logged rather than thrown
 - The same DB also contains independent `session_titles` and append-only `session_recaps` tables. Idle recaps do not enter the session JSONL or model context.
+- History and session-index operations hold a cross-process recovery lease and close their SQLite handles before releasing it, so cooperating processes adopt a replacement on their next operation instead of retaining the old file. Restart older omp processes before relying on this coordination; pre-fix binaries do not participate in the lease.
+- Recovery flushes a `.pending-salvage` journal before removing a corrupt store. Prompts, titles, recaps, and the applied-backup identity commit atomically; an interrupted scan or failed write leaves the journal for retry, and replay after a committed recovery does not duplicate usage counts or recaps.
 
 Use session files for conversation graph/state replay; use `HistoryStorage` for prompt history UX.

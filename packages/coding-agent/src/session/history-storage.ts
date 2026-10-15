@@ -3,16 +3,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	assertSqliteQuickCheck,
-	checkpointWal,
 	getHistoryDbPath,
 	isEnoent,
-	isSqliteBusyError,
 	isSqliteCorruptionError,
 	logger,
 	openSqliteDatabaseSync,
-	postmortem,
 	readDamagedSqliteRows,
+	withSqliteStoreLease,
 } from "@oh-my-pi/pi-utils";
+import { writeFileAtomicallySync } from "../utils/atomic-file";
 import { salvageSessionIndex } from "./session-index";
 
 /** A unique prompt with provenance from its most recent submission. */
@@ -144,8 +143,6 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
 `;
 
-let cancelExitCleanup: (() => void) | undefined;
-
 /**
  * Names the sidecar that records a quarantined store still needing salvage.
  * A peer can hold the replacement's write lock past the busy timeout, so the
@@ -155,20 +152,58 @@ function pendingSalvagePath(dbPath: string): string {
 	return `${dbPath}.pending-salvage`;
 }
 
-/** Backup path recorded by a deferred salvage, if any. */
-function readPendingSalvage(dbPath: string): string | undefined {
+interface PendingSalvage {
+	backupPath: string;
+	sourceIdentity?: string;
+}
+
+/** Accepts the earlier plain-path journal as well as the durable journal record. */
+function readPendingSalvage(dbPath: string): PendingSalvage | undefined {
 	try {
-		const backup = fs.readFileSync(pendingSalvagePath(dbPath), "utf8").trim();
-		return backup || undefined;
+		const content = fs.readFileSync(pendingSalvagePath(dbPath), "utf8").trim();
+		if (!content) throw new Error("Empty history salvage journal");
+		if (!content.startsWith("{")) return { backupPath: content };
+		const record: unknown = JSON.parse(content);
+		if (
+			!record ||
+			typeof record !== "object" ||
+			!("backupPath" in record) ||
+			typeof record.backupPath !== "string" ||
+			!record.backupPath ||
+			("sourceIdentity" in record && typeof record.sourceIdentity !== "string")
+		)
+			throw new Error("Invalid history salvage journal");
+		return {
+			backupPath: record.backupPath,
+			sourceIdentity:
+				"sourceIdentity" in record && typeof record.sourceIdentity === "string" ? record.sourceIdentity : undefined,
+		};
 	} catch (error) {
-		if (!isEnoent(error)) logger.warn("Pending history salvage marker unreadable", { error: String(error) });
+		if (!isEnoent(error)) throw error;
 		return undefined;
 	}
 }
 
+function recordPendingSalvage(dbPath: string, backupPath: string, preserving = false): void {
+	const pending = readPendingSalvage(dbPath);
+	if (pending?.backupPath === backupPath) return;
+	let sourceIdentity: string | undefined;
+	if (preserving) {
+		const stat = fs.statSync(dbPath, { bigint: true });
+		sourceIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+	}
+	// An interrupted quarantine can copy the same original again. Retain its
+	// first durable snapshot, but never discard a different pending generation.
+	if (pending) {
+		if (sourceIdentity && pending.sourceIdentity === sourceIdentity) return;
+		throw new Error(`History recovery still pending from ${pending.backupPath}`);
+	}
+	writeFileAtomicallySync(pendingSalvagePath(dbPath), JSON.stringify({ backupPath, sourceIdentity }));
+}
+
 /** Drops the marker only when it still names `backupPath`, so a newer marker survives. */
 function clearPendingSalvage(dbPath: string, backupPath: string): void {
-	if (readPendingSalvage(dbPath) !== backupPath) return;
+	if (readPendingSalvage(dbPath)?.backupPath !== backupPath) return;
 	try {
 		fs.rmSync(pendingSalvagePath(dbPath), { force: true });
 	} catch (error) {
@@ -178,23 +213,27 @@ function clearPendingSalvage(dbPath: string, backupPath: string): void {
 
 /** Stores searchable prompts with only their latest project and session metadata. */
 export class HistoryStorage {
-	#db: Database;
+	#db!: Database;
 	#dbPath: string;
 	static #instance?: HistoryStorage;
 	#sessionResolver?: () => string | undefined;
 	#addListener?: () => void;
 	#errorListener?: (error: unknown) => void;
 	#writeFailureReported = false;
+	#closed = false;
 
 	// Prepared statements
-	#upsertRowStmt: Statement;
-	#recentStmt: Statement;
-	#searchStmt: Statement;
+	#upsertRowStmt!: Statement;
+	#recentStmt!: Statement;
+	#searchStmt!: Statement;
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
 
-	private constructor(dbPath: string, db: Database) {
+	private constructor(dbPath: string) {
 		this.#dbPath = dbPath;
+	}
+
+	#initialize(db: Database): void {
 		this.#db = db;
 
 		// One-shot statements go through the query cache, which close() finalizes; a
@@ -226,13 +265,13 @@ END;
 				logger.warn("HistoryStorage FTS rebuild failed", { error: String(error) });
 			}
 		}
-		this.#recentStmt = this.#db.prepare(
+		this.#recentStmt = this.#db.query(
 			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${wellFormedRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
 		);
-		this.#searchStmt = this.#db.prepare(
+		this.#searchStmt = this.#db.query(
 			`SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ?1 AND ${wellFormedRowClause("h.")} AND ${historyFilterClause("h.", 2)} ORDER BY h.created_at DESC, h.id DESC LIMIT ?4`,
 		);
-		this.#upsertRowStmt = this.#db.prepare(`
+		this.#upsertRowStmt = this.#db.query(`
 INSERT INTO history (prompt, created_at, cwd, session_id)
 VALUES (?, ${SQLITE_NOW_EPOCH}, ?, ?)
 ON CONFLICT(prompt) DO UPDATE SET
@@ -253,56 +292,51 @@ ON CONFLICT(prompt) DO UPDATE SET
 		if (existing) return existing;
 
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-		let quarantinedPath: string | undefined;
-		return openSqliteDatabaseSync(
-			dbPath,
-			db => {
-				const instance = new HistoryStorage(dbPath, db);
-				const salvageSource = quarantinedPath ?? readPendingSalvage(dbPath);
-				if (salvageSource) instance.#salvageFrom(salvageSource);
-				// Exit-only: a keep-alive cleanup leaves the handle valid so the editor can
-				// keep submitting prompts; the real exit closes. Register before publishing
-				// so a real-exit-in-progress late registration cannot close this instance.
-				cancelExitCleanup = postmortem.register("history-storage", () => HistoryStorage.close(), {
-					exitOnly: true,
-				});
-				HistoryStorage.#instance = instance;
-				return instance;
-			},
-			{
-				recoverCorruption: true,
-				onCorruptionPreserved: backupPath => {
-					quarantinedPath = backupPath;
-				},
-			},
-		);
+		const instance = new HistoryStorage(dbPath);
+		instance.#withStore(() => {});
+		HistoryStorage.#instance = instance;
+		return instance;
 	}
 
-	/** Checkpoints and closes the process-wide database, and permits reopening it. */
+	/** Releases the process-wide facade; connections are scoped to each operation. */
 	static close(): void {
-		const instance = HistoryStorage.#instance;
+		if (HistoryStorage.#instance) HistoryStorage.#instance.#closed = true;
 		HistoryStorage.#instance = undefined;
-		cancelExitCleanup?.();
-		cancelExitCleanup = undefined;
-		if (instance) instance.#close();
 	}
 
-	#close(): void {
-		checkpointWal(this.#db);
-		for (const stmt of this.#substringStmts.values()) stmt.finalize();
-		this.#substringStmts.clear();
-		this.#upsertRowStmt.finalize();
-		this.#recentStmt.finalize();
-		this.#searchStmt.finalize();
-		this.#db.close();
+	#withStore<T>(operation: () => T): T {
+		if (this.#closed) throw new Error("HistoryStorage is closed");
+		return withSqliteStoreLease(this.#dbPath, () => {
+			const db = openSqliteDatabaseSync(
+				this.#dbPath,
+				database => {
+					this.#initialize(database);
+					const pending = readPendingSalvage(this.#dbPath);
+					if (pending) this.#salvageFrom(pending.backupPath);
+					return database;
+				},
+				{
+					recoverCorruption: true,
+					onCorruptionPreserved: backupPath => recordPendingSalvage(this.#dbPath, backupPath, true),
+				},
+			);
+			try {
+				return operation();
+			} finally {
+				this.#substringStmts.clear();
+				db.close();
+			}
+		});
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>): void {
-		this.#db.transaction((rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>) => {
-			for (const row of rows) {
-				this.#upsertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
-			}
-		})(rows);
+		this.#withStore(() => {
+			this.#db.transaction(() => {
+				for (const row of rows) {
+					this.#upsertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
+				}
+			})();
+		});
 	}
 
 	/**
@@ -357,8 +391,10 @@ ON CONFLICT(prompt) DO UPDATE SET
 		if (safeLimit === 0) return [];
 
 		try {
-			const rows = this.#recentStmt.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit) as HistoryRow[];
-			return rows.map(row => this.#toEntry(row));
+			return this.#withStore(() => {
+				const rows = this.#recentStmt.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit) as HistoryRow[];
+				return rows.map(row => this.#toEntry(row));
+			});
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
 			return [];
@@ -367,6 +403,15 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	/** Finds unique prompts matching every query token, newest first. */
 	search(query: string, limit: number, filter: HistoryFilter = {}): HistoryEntry[] {
+		try {
+			return this.#withStore(() => this.#search(query, limit, filter));
+		} catch (error) {
+			logger.error("HistoryStorage search failed", { error: String(error) });
+			return [];
+		}
+	}
+
+	#search(query: string, limit: number, filter: HistoryFilter): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
 
@@ -529,25 +574,21 @@ ON CONFLICT(prompt) DO UPDATE SET
 	}
 
 	/**
-	 * Copies every readable, well-formed row of a quarantined store, including
-	 * the session-index tables it shares, into this fresh one. The prompt
-	 * insert is booked by a `<db>.pending-salvage` marker written before the
-	 * transaction and removed after it: a `SQLITE_BUSY` racing a peer's write
-	 * lock (or a crash mid-salvage) leaves the marker, so the next {@link open}
-	 * retries instead of stranding the readable prompts in the backup. Other
-	 * failures are logged, the marker is cleared, and this store stays usable.
+	 * Prompts, index rows, and the applied-backup identity commit together.
+	 * The durable pointer survives scanning, transaction failure, and a crash
+	 * after COMMIT; the ledger makes a replay after COMMIT a no-op.
 	 */
 	#salvageFrom(backupPath: string): void {
-		let source: Database;
+		let source: Database | undefined;
 		try {
+			recordPendingSalvage(this.#dbPath, backupPath);
+			this.#db.run("CREATE TABLE IF NOT EXISTS history_salvage_applied (backup_path TEXT PRIMARY KEY)");
+			const applied = this.#db.query("SELECT 1 FROM history_salvage_applied WHERE backup_path = ?");
+			if (applied.get(backupPath)) {
+				clearPendingSalvage(this.#dbPath, backupPath);
+				return;
+			}
 			source = new Database(backupPath, { readonly: true });
-		} catch (error) {
-			logger.error("HistoryStorage salvage failed", { backupPath, error: String(error) });
-			// The recorded backup is gone or unreadable; the marker points nowhere.
-			clearPendingSalvage(this.#dbPath, backupPath);
-			return;
-		}
-		try {
 			const { rows, damagedRegions } = readDamagedSqliteRows<HistoryRow>(
 				source,
 				"history",
@@ -555,30 +596,25 @@ ON CONFLICT(prompt) DO UPDATE SET
 				wellFormedRowClause(""),
 			);
 			const salvaged = collapseByPrompt(rows);
-			try {
-				fs.writeFileSync(pendingSalvagePath(this.#dbPath), `${backupPath}\n`);
-			} catch (error) {
-				logger.warn("Pending history salvage marker could not be written", { error: String(error) });
-			}
-			this.#db.transaction(() => this.#insertRows(salvaged))();
+			const backup = source;
+			this.#db
+				.transaction(() => {
+					if (applied.get(backupPath)) return;
+					this.#insertRows(salvaged);
+					salvageSessionIndex(backup, this.#db);
+					this.#db.query("INSERT INTO history_salvage_applied (backup_path) VALUES (?)").run(backupPath);
+				})
+				.immediate();
 			clearPendingSalvage(this.#dbPath, backupPath);
-			logger.warn("HistoryStorage salvaged prompts from a corrupt store", {
+			logger.warn("HistoryStorage salvaged a corrupt store", {
 				backupPath,
 				salvaged: salvaged.length,
 				damagedRegions,
 			});
 		} catch (error) {
-			if (!isSqliteBusyError(error)) clearPendingSalvage(this.#dbPath, backupPath);
-			logger.error("HistoryStorage salvage failed", {
-				backupPath,
-				deferred: isSqliteBusyError(error),
-				error: String(error),
-			});
-		}
-		try {
-			salvageSessionIndex(source, this.#db);
+			logger.error("HistoryStorage salvage deferred", { backupPath, error: String(error) });
 		} finally {
-			source.close();
+			source?.close();
 		}
 	}
 
@@ -617,7 +653,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 		const whereClause = [...tokenClauses, wellFormedRowClause(""), historyFilterClause("", tokenCount + 1)].join(
 			" AND ",
 		);
-		stmt = this.#db.prepare(
+		stmt = this.#db.query(
 			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?${tokenCount + 3}`,
 		);
 		this.#substringStmts.set(tokenCount, stmt);

@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
 	isSqliteCorruptionError,
 	onSqliteStoreQuarantine,
@@ -65,6 +66,82 @@ async function corruptLeafHolding(
 	}
 	throw new Error(`no leaf page holds rowid ${smallestId}`);
 }
+
+async function waitForFile(filePath: string): Promise<void> {
+	if (fs.existsSync(filePath)) return;
+	const watcher = fs.watch(path.dirname(filePath));
+	try {
+		await new Promise<void>(resolve => {
+			const check = () => {
+				if (fs.existsSync(filePath)) resolve();
+			};
+			watcher.on("change", check);
+			watcher.on("rename", check);
+			if (fs.existsSync(filePath)) resolve();
+		});
+	} finally {
+		watcher.close();
+	}
+}
+
+// This exercises a real OS lock across processes; fake timers cannot control
+// the child process while it synchronously waits inside the lease.
+test("store leases serialize independent processes and close handles before release", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-lease-");
+	const dbPath = dir.join("store.db");
+	const readyPath = dir.join("ready");
+	const releasePath = dir.join("release");
+	const blockedPath = dir.join("blocked");
+	const resultPath = dir.join("result");
+	const sqliteModule = pathToFileURL(path.join(import.meta.dir, "../src/sqlite.ts")).href;
+	const lockModule = pathToFileURL(path.join(import.meta.dir, "../src/file-lock.ts")).href;
+	const firstPath = dir.join("first.ts");
+	const secondPath = dir.join("second.ts");
+	await Bun.write(
+		firstPath,
+		`import * as fs from "node:fs";\n` +
+			`import { Database } from "bun:sqlite";\n` +
+			`import { withSqliteStoreLease } from ${JSON.stringify(sqliteModule)};\n` +
+			`withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {\n` +
+			`\tconst db = new Database(${JSON.stringify(dbPath)});\n` +
+			`\ttry { db.run("CREATE TABLE entries (value TEXT)"); withSqliteStoreLease(${JSON.stringify(dbPath)}, () => db.run("INSERT INTO entries VALUES ('first')")); withSqliteStoreLease(${JSON.stringify(dbPath)}, () => { if (db.query("SELECT count(*) AS count FROM entries").get().count !== 1) throw new Error("nested write missing"); }); fs.writeFileSync(${JSON.stringify(readyPath)}, "ready"); while (!fs.existsSync(${JSON.stringify(releasePath)})) Bun.sleepSync(5); }\n` +
+			`\tfinally { db.close(); }\n` +
+			`});\n`,
+	);
+	await Bun.write(
+		secondPath,
+		`import * as fs from "node:fs";\n` +
+			`import { Database } from "bun:sqlite";\n` +
+			`import { tryAcquireFileLock } from ${JSON.stringify(lockModule)};\n` +
+			`import { withSqliteStoreLease } from ${JSON.stringify(sqliteModule)};\n` +
+			`if (tryAcquireFileLock(${JSON.stringify(`${dbPath}.recovery`)})) throw new Error("lease was not held");\n` +
+			`fs.writeFileSync(${JSON.stringify(blockedPath)}, "ready");\n` +
+			`withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {\n` +
+			`\tconst db = new Database(${JSON.stringify(dbPath)});\n` +
+			`\ttry { if (db.query("SELECT value FROM entries").get()?.value !== "first") throw new Error("first write missing"); fs.writeFileSync(${JSON.stringify(resultPath)}, "ready"); }\n` +
+			`\tfinally { db.close(); }\n` +
+			`});\n`,
+	);
+
+	const first = Bun.spawn([process.execPath, firstPath], { stdout: "ignore", stderr: "pipe" });
+	let second: Bun.Subprocess | undefined;
+	try {
+		await waitForFile(readyPath);
+		second = Bun.spawn([process.execPath, secondPath], { stdout: "ignore", stderr: "pipe" });
+		await waitForFile(blockedPath);
+		expect(fs.existsSync(resultPath)).toBe(false);
+		await Bun.write(releasePath, "release");
+		expect(await first.exited).toBe(0);
+		expect(await second.exited).toBe(0);
+		expect(await Bun.file(resultPath).text()).toBe("ready");
+	} finally {
+		first.kill();
+		second?.kill();
+		await first.exited;
+		if (second) await second.exited;
+	}
+});
+
 test("failed asynchronous initialization releases and rolls back its write transaction", async () => {
 	await using dir = await TempDir.create("@omp-sqlite-init-");
 	const dbPath = dir.join("store.db");
@@ -143,6 +220,25 @@ test("synchronous recovery preserves malformed schema pages and yields a persist
 	expect(rows).toEqual([{ value: "usable" }]);
 });
 
+test("preservation callback runs under the recovery lease before unlinking originals", async () => {
+	await using dir = await TempDir.create("@omp-sqlite-preservation-callback-");
+	const dbPath = dir.join("store.db");
+	await corruptSchemaPages(dbPath);
+
+	expect(() =>
+		openSqliteDatabaseSync(dbPath, db => db.run("CREATE TABLE recovered (value TEXT)"), {
+			recoverCorruption: true,
+			onCorruptionPreserved(backupPath) {
+				expect(fs.existsSync(dbPath)).toBe(true);
+				expect(fs.existsSync(backupPath)).toBe(true);
+				throw new Error("marker persistence failed");
+			},
+		}),
+	).toThrow("marker persistence failed");
+	expect(fs.existsSync(dbPath)).toBe(true);
+	expect((await backupNames(dir.path())).filter(name => !/-wal$|-shm$|-journal$/.test(name))).toHaveLength(1);
+});
+
 test("recovery preserves sidecars present at corruption detection under one private backup name", async () => {
 	await using dir = await TempDir.create("@omp-sqlite-sidecars-");
 	const dbPath = dir.join("store.db");
@@ -219,11 +315,23 @@ test("a second corruption failure surfaces without rotating the first backup aga
 	await using dir = await TempDir.create("@omp-sqlite-repeat-corrupt-");
 	const dbPath = dir.join("store.db");
 	const damaged = await corruptSchemaPages(dbPath);
+	let attempts = 0;
 	await expect(
-		openSqliteDatabase(dbPath, db => db.run("CREATE TABLE recovered (value TEXT)"), {
-			recoverCorruption: true,
-			onCorruptionPreserved: backupPath => fs.copyFileSync(backupPath, dbPath),
-		}),
+		openSqliteDatabase(
+			dbPath,
+			db => {
+				if (attempts++ === 0) return db.run("CREATE TABLE recovered (value TEXT)");
+				db.close();
+				fs.writeFileSync(dbPath, damaged);
+				const corruptReplacement = new Database(dbPath);
+				try {
+					corruptReplacement.run("CREATE TABLE recovered (value TEXT)");
+				} finally {
+					corruptReplacement.close();
+				}
+			},
+			{ recoverCorruption: true },
+		),
 	).rejects.toMatchObject({ code: "SQLITE_CORRUPT", message: expect.stringContaining(dbPath) });
 	const backups = await backupNames(dir.path());
 	expect(backups).toHaveLength(1);

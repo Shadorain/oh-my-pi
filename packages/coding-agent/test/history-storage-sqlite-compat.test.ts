@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { lookupSessionTitle, resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import * as utils from "@oh-my-pi/pi-utils";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { readLines, TempDir } from "@oh-my-pi/pi-utils";
 import { readTableSql } from "./helpers/sqlite-inspect";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
@@ -410,7 +410,7 @@ function seedSalvageBackup(backupPath: string): void {
 		);
 	`);
 	backup
-		.prepare("INSERT INTO history (prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?)")
+		.query("INSERT INTO history (prompt, created_at, cwd, session_id) VALUES (?, ?, ?, ?)")
 		.run("stranded prompt", 1_700_000_000, "/project", "session-a");
 	backup.close();
 }
@@ -450,11 +450,17 @@ it("defers a salvage whose insert loses the write lock to a peer, then retries i
 		return result;
 	});
 
-	const locked = HistoryStorage.open(dbPath);
-	expect(locked.getRecent(10)).toEqual([]);
-	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(true);
-	peer!.run("COMMIT");
-	peer!.close();
+	try {
+		const locked = HistoryStorage.open(dbPath);
+		expect(locked.getRecent(10)).toEqual([]);
+		expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(true);
+	} finally {
+		try {
+			peer?.run("ROLLBACK");
+		} finally {
+			peer?.close();
+		}
+	}
 	HistoryStorage.close();
 
 	const reopened = HistoryStorage.open(dbPath);
@@ -484,3 +490,146 @@ it("clears a failed index-open latch when the store is quarantined and replaced"
 	const failures = warnSpy.mock.calls.filter(c => String(c[0] || "").includes("Session index unavailable"));
 	expect(failures.length).toBe(1);
 });
+
+it("records recovery before the first backup scan and retains it when scanning fails", async () => {
+	tempDir = TempDir.createSync("@omp-history-salvage-scan-interruption-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 2);
+	let recordedBackup: string | undefined;
+	const scan = vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation(() => {
+		recordedBackup = fs.readFileSync(`${dbPath}.pending-salvage`, "utf8").trim();
+		throw new Error("interrupted backup scan");
+	});
+	HistoryStorage.open(dbPath);
+	expect(recordedBackup).toBeDefined();
+	expect(fs.readFileSync(`${dbPath}.pending-salvage`, "utf8").trim()).toBe(recordedBackup);
+	scan.mockRestore();
+	HistoryStorage.close();
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(entry => entry.prompt),
+	).toEqual(["second prompt", "first prompt"]);
+});
+
+it("does not count prompts or copy recaps twice when a committed backup is replayed", async () => {
+	tempDir = TempDir.createSync("@omp-history-salvage-committed-replay-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	await seedDamagedStore(backupPath, 2);
+	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	const first = HistoryStorage.open(dbPath);
+	expect(first.getRecent(10).map(entry => entry.useCount)).toEqual([1, 1]);
+	await first.add("second prompt", "/new", "new-session");
+	HistoryStorage.close();
+	// A crash after COMMIT or a failed unlink leaves exactly this journal state.
+	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	const replayed = HistoryStorage.open(dbPath);
+	expect(replayed.getRecent(10).map(entry => ({ prompt: entry.prompt, count: entry.useCount }))).toEqual([
+		{ prompt: "second prompt", count: 2 },
+		{ prompt: "first prompt", count: 1 },
+	]);
+	HistoryStorage.close();
+	const verify = new Database(dbPath, { readonly: true });
+	try {
+		expect(verify.query("SELECT recap FROM session_recaps").all()).toEqual([{ recap: "kept recap" }]);
+	} finally {
+		verify.close();
+	}
+});
+
+it("rolls back prompt salvage and retries all tables when session-index recovery fails", async () => {
+	tempDir = TempDir.createSync("@omp-history-salvage-index-interruption-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	await seedDamagedStore(backupPath, 2);
+	fs.writeFileSync(`${dbPath}.pending-salvage`, `${backupPath}\n`);
+	const readDamaged = utils.readDamagedSqliteRows;
+	const scan = vi.spyOn(utils, "readDamagedSqliteRows").mockImplementation((db, table, columns, predicate) => {
+		if (table === "session_recaps") throw new Error("interrupted index scan");
+		return readDamaged(db, table, columns, predicate);
+	});
+	expect(HistoryStorage.open(dbPath).getRecent(10)).toEqual([]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(true);
+	scan.mockRestore();
+	HistoryStorage.close();
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(entry => entry.useCount),
+	).toEqual([1, 1]);
+	HistoryStorage.close();
+	const verify = new Database(dbPath, { readonly: true });
+	try {
+		expect(verify.query("SELECT title FROM session_titles").all()).toEqual([{ title: "kept title" }]);
+		expect(verify.query("SELECT recap FROM session_recaps").all()).toEqual([{ recap: "kept recap" }]);
+	} finally {
+		verify.close();
+	}
+});
+
+it("leaves the original store in place when recovery intent cannot be persisted", async () => {
+	tempDir = TempDir.createSync("@omp-history-salvage-journal-write-failure-");
+	const dbPath = tempDir.join("history.db");
+	await seedDamagedStore(dbPath, 2);
+	const original = fs.statSync(dbPath, { bigint: true });
+	const rename = fs.renameSync;
+	const fail = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+		if (String(destination) === `${dbPath}.pending-salvage`) throw new Error("journal publication failed");
+		return rename(source, destination);
+	});
+	expect(() => HistoryStorage.open(dbPath)).toThrow("journal publication failed");
+	expect(fs.statSync(dbPath, { bigint: true }).ino).toBe(original.ino);
+	fail.mockRestore();
+	expect(
+		HistoryStorage.open(dbPath)
+			.getRecent(10)
+			.map(entry => entry.prompt),
+	).toEqual(["second prompt", "first prompt"]);
+});
+
+it("an already-open process writes to the replacement after another process recovers the store", async () => {
+	tempDir = TempDir.createSync("@omp-history-live-peer-");
+	const dbPath = tempDir.join("history.db");
+	await HistoryStorage.open(dbPath).add("before replacement");
+	HistoryStorage.close();
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			"--eval",
+			`
+import { HistoryStorage } from ${JSON.stringify(import.meta.resolve("../src/session/history-storage.ts"))};
+import { readLines } from ${JSON.stringify(import.meta.resolve("../../utils/src/stream.ts"))};
+const storage = HistoryStorage.open(process.argv[1]);
+process.stdout.write("ready\\n");
+for await (const _ of readLines(Bun.stdin.stream())) {
+	await storage.add("peer after replacement");
+	process.stdout.write(JSON.stringify(storage.getRecent(10).map(row => row.prompt)) + "\\n");
+	break;
+}
+HistoryStorage.close();
+`,
+			dbPath,
+		],
+		{ stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+	);
+	const output = readLines(child.stdout);
+	const decode = new TextDecoder();
+	try {
+		expect(decode.decode((await output.next()).value)).toBe("ready");
+		await seedDamagedStore(dbPath, 2);
+		const replacement = HistoryStorage.open(dbPath);
+		expect(replacement.search("first", 10).map(row => row.prompt)).toEqual(["first prompt"]);
+		child.stdin.write("continue\n");
+		child.stdin.end();
+		const observed: unknown = JSON.parse(decode.decode((await output.next()).value));
+		expect(observed).toContain("peer after replacement");
+		expect(observed).toContain("first prompt");
+		expect(await child.exited).toBe(0);
+		expect(replacement.search("peer after", 10).map(row => row.prompt)).toEqual(["peer after replacement"]);
+	} finally {
+		child.kill();
+		await child.exited;
+		await output.return(undefined);
+	}
+}, 15_000);

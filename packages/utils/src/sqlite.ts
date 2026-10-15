@@ -7,6 +7,36 @@ import { withFileLockSync } from "./file-lock";
 import { isEnoent } from "./fs-error";
 import * as logger from "./logger";
 
+const sqliteStoreLeaseDepth = new Map<string, number>();
+
+/**
+ * Runs a synchronous store operation under the same cross-process lock used
+ * for corruption recovery. Reentrancy is limited to this process and thread;
+ * callbacks must not be async. The callback must close every database and
+ * finalize every statement before returning; no SQLite handle may outlive the lease.
+ */
+export function withSqliteStoreLease<T>(dbPath: string, operation: () => T): T {
+	const key = corruptHandleKey(dbPath);
+	const depth = sqliteStoreLeaseDepth.get(key) ?? 0;
+	if (depth > 0) {
+		sqliteStoreLeaseDepth.set(key, depth + 1);
+		try {
+			return operation();
+		} finally {
+			sqliteStoreLeaseDepth.set(key, depth);
+		}
+	}
+
+	return withFileLockSync(`${key}.recovery`, () => {
+		sqliteStoreLeaseDepth.set(key, 1);
+		try {
+			return operation();
+		} finally {
+			sqliteStoreLeaseDepth.delete(key);
+		}
+	});
+}
+
 const BUSY_MAX_ATTEMPTS = 4;
 const BUSY_BASE_DELAY_MS = 100;
 const SQLITE_STORE_SUFFIXES = ["-wal", "-shm", "-journal", ""];
@@ -144,7 +174,7 @@ export interface SqliteOpenOptions {
 	 * initializer once more. Disabled by default.
 	 */
 	recoverCorruption?: boolean;
-	/** Runs after preservation and before the replacement is initialized. */
+	/** Runs after preservation and before the original store is unlinked, while holding its recovery lease. */
 	onCorruptionPreserved?: (backupPath: string, error: unknown) => void;
 }
 
@@ -232,7 +262,12 @@ function openOnce<T>(dbPath: string, initialize: (db: Database) => T, options: S
 	}
 }
 
-function quarantineCorruptSqliteStore(dbPath: string, db: Database | undefined): string {
+function quarantineCorruptSqliteStore(
+	dbPath: string,
+	db: Database | undefined,
+	options: SqliteOpenOptions,
+	error: unknown,
+): string {
 	const backupPath = `${dbPath}.corrupt-${Date.now()}-${crypto.randomUUID()}`;
 	const preserved: string[] = [];
 	// Closing a failed WAL connection can truncate its WAL. Copy evidence
@@ -248,11 +283,11 @@ function quarantineCorruptSqliteStore(dbPath: string, db: Database | undefined):
 		}
 	}
 	db?.close();
-	// Only Windows refuses to unlink a file another handle still holds. Elsewhere
-	// each peer must keep its own handle until it closes it after adopting the
-	// replacement; closing it here races the peer's recovery on POSIX.
+	// All current-version store operations hold the recovery lease and close
+	// their handles before releasing it, so no peer can retain this inode.
 	if (process.platform === "win32") closePeerCorruptHandles(dbPath, db);
 	runQuarantineHooks(dbPath);
+	options.onCorruptionPreserved?.(backupPath, error);
 
 	const removed: string[] = [];
 	try {
@@ -300,13 +335,13 @@ function recoverCorruptDatabase(dbPath: string, error: unknown, options: SqliteO
 	let backupPath: string | null;
 	try {
 		try {
-			backupPath = withFileLockSync(`${dbPath}.recovery`, () => {
+			backupPath = withSqliteStoreLease(dbPath, () => {
 				const currentIdentity = sqliteFileIdentity(dbPath);
 				if (failure.identity === undefined || currentIdentity === undefined) {
 					throw new Error("could not verify the corrupt database file identity");
 				}
 				if (currentIdentity !== failure.identity) return null;
-				return quarantineCorruptSqliteStore(dbPath, failure.db);
+				return quarantineCorruptSqliteStore(dbPath, failure.db, options, failure.original);
 			});
 		} finally {
 			unregisterCorruptHandle(dbPath, failure.db);
@@ -322,7 +357,6 @@ function recoverCorruptDatabase(dbPath: string, error: unknown, options: SqliteO
 		backupPath,
 		warning: "Stored credentials from this database may require re-login.",
 	});
-	options.onCorruptionPreserved?.(backupPath, failure.original);
 }
 
 /**
