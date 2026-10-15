@@ -11,6 +11,10 @@
 
 - SQLite recovery flushes preserved evidence before replacement, and path comparison helpers can retain canonical aliases while a target is temporarily missing ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 
+### Fixed
+
+- Fixed SQLite salvage skipping the minimum signed rowid ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+
 ## [18.10.0] - 2026-10-12
 
 ### Added

@@ -558,6 +558,33 @@ test("damaged-row salvage terminates on a huge sparse AUTOINCREMENT high-water m
 	}
 });
 
+test("damaged-row salvage includes both signed rowid endpoints without duplicates", () => {
+	const db = new Database(":memory:");
+	try {
+		db.exec(`
+			CREATE TABLE entries (id INTEGER PRIMARY KEY, value TEXT);
+			INSERT INTO entries VALUES (-9223372036854775808, 'minimum');
+		`);
+		expect(readDamagedSqliteRows(db, "entries", "CAST(id AS TEXT) AS id, value").rows).toEqual([
+			{ id: "-9223372036854775808", value: "minimum" },
+		]);
+		db.exec(`
+			INSERT INTO entries VALUES (0, 'zero'), (9007199254740993, 'wide'), (9223372036854775807, 'maximum');
+		`);
+		expect(readDamagedSqliteRows(db, "entries", "CAST(id AS TEXT) AS id, value")).toEqual({
+			rows: [
+				{ id: "-9223372036854775808", value: "minimum" },
+				{ id: "0", value: "zero" },
+				{ id: "9007199254740993", value: "wide" },
+				{ id: "9223372036854775807", value: "maximum" },
+			],
+			damagedRegions: 0,
+		});
+	} finally {
+		db.close();
+	}
+});
+
 test.each([
 	{ region: "a middle leaf", page: (pages: number) => Math.floor(pages / 2), lastSurvives: true },
 	{ region: "the rightmost leaf", page: (pages: number) => pages, lastSurvives: false },

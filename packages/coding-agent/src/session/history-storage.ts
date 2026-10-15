@@ -120,14 +120,17 @@ function collapseByPrompt(rows: Array<HistoryRow | SalvagedHistoryRow>): Salvage
 }
 
 /** Selects the canonical row columns, defaulting those that predate `session_id` and `use_count`. */
-function historyRowColumns(db: Database, losslessId = false): string {
+function historyRowSelection(db: Database, losslessId = false): { columns: string; predicate: string } {
 	const names = new Set(
 		(db.query("PRAGMA table_info(history)").all() as Array<{ name: string }>).map(col => col.name),
 	);
 	const id = losslessId ? "CAST(id AS TEXT) AS id" : "id";
 	const sessionId = names.has("session_id") ? "session_id" : "NULL AS session_id";
 	const useCount = names.has("use_count") ? "use_count" : "1 AS use_count";
-	return `${id}, prompt, created_at, cwd, ${sessionId}, ${useCount}`;
+	return {
+		columns: `${id}, prompt, created_at, cwd, ${sessionId}, ${useCount}`,
+		predicate: `${wellFormedRowClause("")} AND typeof(${names.has("use_count") ? "use_count" : "1"}) = 'integer'`,
+	};
 }
 
 /** Keep the allocation high-water mark in SQLite's integer domain, including values above 2^53. */
@@ -598,9 +601,8 @@ ON CONFLICT(prompt) DO UPDATE SET
 				const highWater = readHistorySequence(this.#db);
 				let rows: SalvagedHistoryRow[];
 				try {
-					rows = this.#db
-						.query(`SELECT ${historyRowColumns(this.#db, true)} FROM history WHERE ${wellFormedRowClause("")}`)
-						.all() as SalvagedHistoryRow[];
+					const { columns, predicate } = historyRowSelection(this.#db, true);
+					rows = this.#db.query(`SELECT ${columns} FROM history WHERE ${predicate}`).all() as SalvagedHistoryRow[];
 				} catch (error) {
 					if (isSqliteCorruptionError(error)) throw error;
 					logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
@@ -707,16 +709,10 @@ ON CONFLICT(prompt) DO UPDATE SET
 					).rows;
 				}, []);
 				highWater = readSource(() => readHistorySequence(backup), null);
-				history = readSource(
-					() =>
-						readDamagedSqliteRows<SalvagedHistoryRow>(
-							backup,
-							"history",
-							historyRowColumns(backup, true),
-							wellFormedRowClause(""),
-						),
-					history,
-				);
+				history = readSource(() => {
+					const { columns, predicate } = historyRowSelection(backup, true);
+					return readDamagedSqliteRows<SalvagedHistoryRow>(backup, "history", columns, predicate);
+				}, history);
 				index = readSource(() => readSalvagedSessionIndex(backup), undefined);
 				source.close();
 				source = undefined;

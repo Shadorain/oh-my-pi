@@ -434,6 +434,52 @@ it("salvages a recorded backup whose earlier pass was deferred", async () => {
 	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
 });
 
+it("finishes salvage despite malformed counters and does not replay recovered rows", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-bad-counter-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	const backup = new Database(backupPath);
+	backup.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY, prompt TEXT, created_at INTEGER,
+			cwd TEXT, session_id TEXT, use_count INTEGER
+		);
+		INSERT INTO history VALUES
+			(1, 'kept prompt', 1, NULL, NULL, 3),
+			(2, 'null count', 2, NULL, NULL, NULL),
+			(3, 'text count', 3, NULL, NULL, 'invalid'),
+			(4, 'blob count', 4, NULL, NULL, X'0102');
+	`);
+	backup.close();
+	queueBackup(dbPath, backupPath);
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(storage.getRecent(10)).toMatchObject([{ prompt: "kept prompt", useCount: 3 }]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+	await storage.add("after salvage");
+	HistoryStorage.close();
+	const reopened = HistoryStorage.open(dbPath);
+	expect(reopened.search("kept", 10)).toMatchObject([{ prompt: "kept prompt", useCount: 3 }]);
+	expect(reopened.search("after", 10).map(entry => entry.prompt)).toEqual(["after salvage"]);
+});
+
+it("salvages legacy backups without a counter using the submission default", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-legacy-backup-");
+	const dbPath = tempDir.join("history.db");
+	const backupPath = tempDir.join("history.db.corrupt-backup");
+	const backup = new Database(backupPath);
+	backup.exec(`
+		CREATE TABLE history (id INTEGER PRIMARY KEY, prompt TEXT, created_at INTEGER, cwd TEXT);
+		INSERT INTO history VALUES (1, 'legacy recovered prompt', 1, '/legacy');
+	`);
+	backup.close();
+	queueBackup(dbPath, backupPath);
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(storage.getRecent(10)).toMatchObject([{ prompt: "legacy recovered prompt", cwd: "/legacy", useCount: 1 }]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
 it("defers a salvage whose insert loses the write lock to a peer, then retries it", async () => {
 	tempDir = TempDir.createSync("@omp-history-storage-busy-salvage-");
 	const dbPath = tempDir.join("history.db");

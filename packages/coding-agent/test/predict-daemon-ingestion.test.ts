@@ -186,6 +186,45 @@ withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {
 		}
 	});
 
+	it("restarts learning from an oversized checkpoint but preserves SQLite's maximum cursor", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-predict-invalid-cursor-"));
+		const dbPath = path.join(dir, "history.db");
+		createHistory(dbPath, 1, "learn after invalid checkpoint");
+		const seen: string[] = [];
+		const predictor = {
+			observe: async (prompts: string[]) => {
+				seen.push(...prompts);
+			},
+			persist: async () => {},
+		} as unknown as TextPredictor;
+		try {
+			const first = new Engine("ngram", dir, predictor, { historyId: "0" });
+			await first.ingest(dbPath);
+			await first.persist();
+			const checkpoint = await readCursor(dir);
+			await Bun.write(
+				path.join(dir, "cursor.json"),
+				JSON.stringify({ ...checkpoint, historyId: "9223372036854775808" }),
+			);
+			seen.length = 0;
+			const restarted = new Engine("ngram", dir, predictor, await readCursor(dir));
+			expect(await restarted.ingest(dbPath)).toBe(1);
+			const writer = new Database(dbPath);
+			try {
+				writer.run("INSERT INTO history VALUES (9223372036854775807, 'maximum prompt')");
+			} finally {
+				writer.close();
+			}
+			expect(await restarted.ingest(dbPath)).toBe(1);
+			await restarted.persist();
+			const atMaximum = new Engine("ngram", dir, predictor, await readCursor(dir));
+			expect(await atMaximum.ingest(dbPath)).toBe(0);
+			expect(seen).toEqual(["learn after invalid checkpoint", "maximum prompt"]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("skips non-text prompts and does not create a missing history database", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-predict-ingest-"));
 		const dbPath = path.join(dir, "history.db");

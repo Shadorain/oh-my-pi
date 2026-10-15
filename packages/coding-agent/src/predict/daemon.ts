@@ -59,7 +59,8 @@ export interface HistoryCursor {
 const HISTORY_ID_PATTERN = /^(?:0|[1-9]\d{0,19})$/;
 
 function parseHistoryCursorId(value: unknown): string {
-	if (typeof value === "string" && HISTORY_ID_PATTERN.test(value)) return value;
+	if (typeof value === "string" && HISTORY_ID_PATTERN.test(value) && BigInt(value) <= 9223372036854775807n)
+		return value;
 	// Existing checkpoints predate decimal ids; migrate only values JS represented exactly.
 	if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
 	return "0";

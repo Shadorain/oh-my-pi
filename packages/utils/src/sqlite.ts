@@ -525,6 +525,9 @@ export function readDamagedSqliteRows<T>(
 		if (seek.ok) kept.push({ rowid: seek.rowid, row: seek.row });
 	};
 
+	// The initial half-open interval cannot visit its own lower endpoint.
+	keep(read(exactStmt, MIN_SQLITE_ROWID));
+
 	// Half-open intervals (lo, hi] of unexplored seek origins, each swept in one
 	// direction: 1 ascends from `lo` with `rowid >` seeks, -1 descends from `hi`
 	// with `rowid <=`/`rowid <` seeks. `deadBoundary` marks an interval whose
