@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.11.1] - 2026-10-15
+
 ### Added
 
 - Added `listWorkspace({ reportDirectoryErrors })`: an unreadable root fails the scan and unreadable subdirectories are returned in `unreadableDirectories` instead of being silently skipped ([#15769](https://github.com/can1357/oh-my-pi/issues/15769)).

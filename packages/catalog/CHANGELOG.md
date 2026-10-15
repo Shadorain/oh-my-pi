@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.11.1] - 2026-10-15
+
 ### Fixed
 
 - Enabled long prompt-cache retention (`ttl: "1h"`) for Claude models on `google-vertex` ([#15505](https://github.com/can1357/oh-my-pi/pull/15505) by [@hpost](https://github.com/hpost))
