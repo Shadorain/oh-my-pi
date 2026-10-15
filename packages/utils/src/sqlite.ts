@@ -438,7 +438,22 @@ export function checkpointWal(db: Database): void {
 	db.run("PRAGMA wal_checkpoint(PASSIVE)");
 }
 
-type SalvageSeek = { rowid: number; ok: boolean; row: Record<string, unknown> } | "end" | "damaged";
+type SalvageSeek = { rowid: bigint; ok: boolean; row: Record<string, unknown> } | "end" | "damaged";
+
+/** SQLite's signed 64-bit rowid domain; `number` would lose precision there. */
+const MIN_SQLITE_ROWID = -(1n << 63n);
+const MAX_SQLITE_ROWID = (1n << 63n) - 1n;
+
+/** Step values are counts, not database keys, so `bigint` stays exact and safe. */
+function probeAt(origin: bigint, delta: bigint, boundary: bigint): bigint {
+	const shifted = origin + delta;
+	return delta > 0n ? (shifted > boundary ? boundary : shifted) : shifted < boundary ? boundary : shifted;
+}
+
+/** Bind rowid boundaries as decimal text; SQLite's CAST preserves all signed int64 bits. */
+function bindRowid(origin: bigint): string {
+	return origin.toString();
+}
 
 /**
  * Reads every readable row of a possibly damaged rowid table. Rows are
@@ -465,22 +480,24 @@ export function readDamagedSqliteRows<T>(
 	columns: string,
 	predicate = "1",
 ): { rows: T[]; damagedRegions: number } {
-	const selection = `rowid AS __salvage_rowid, (${predicate}) AS __salvage_ok, ${columns}`;
-	const nextStmt = db.query<Record<string, unknown>, [number]>(
-		`SELECT ${selection} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT 1`,
+	const selection = `CAST(rowid AS TEXT) AS __salvage_rowid, (${predicate}) AS __salvage_ok, ${columns}`;
+	const nextStmt = db.query<Record<string, unknown>, [string]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid > CAST(? AS INTEGER) ORDER BY rowid LIMIT 1`,
 	);
-	const exactStmt = db.query<Record<string, unknown>, [number]>(`SELECT ${selection} FROM ${table} WHERE rowid = ?`);
-	const topStmt = db.query<Record<string, unknown>, [number]>(
-		`SELECT ${selection} FROM ${table} WHERE rowid <= ? ORDER BY rowid DESC LIMIT 1`,
+	const exactStmt = db.query<Record<string, unknown>, [string]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid = CAST(? AS INTEGER)`,
 	);
-	const prevStmt = db.query<Record<string, unknown>, [number]>(
-		`SELECT ${selection} FROM ${table} WHERE rowid < ? ORDER BY rowid DESC LIMIT 1`,
+	const topStmt = db.query<Record<string, unknown>, [string]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid <= CAST(? AS INTEGER) ORDER BY rowid DESC LIMIT 1`,
+	);
+	const prevStmt = db.query<Record<string, unknown>, [string]>(
+		`SELECT ${selection} FROM ${table} WHERE rowid < CAST(? AS INTEGER) ORDER BY rowid DESC LIMIT 1`,
 	);
 	let damagedRegions = 0;
-	const read = (stmt: Statement<Record<string, unknown>, [number]>, origin: number): SalvageSeek => {
+	const read = (stmt: Statement<Record<string, unknown>, [string]>, origin: bigint): SalvageSeek => {
 		let hit: Record<string, unknown> | null;
 		try {
-			hit = stmt.get(origin);
+			hit = stmt.get(bindRowid(origin));
 		} catch (error) {
 			if (!isSqliteCorruptionError(error)) throw error;
 			damagedRegions++;
@@ -488,19 +505,20 @@ export function readDamagedSqliteRows<T>(
 		}
 		if (!hit) return "end";
 		const { __salvage_rowid: rowid, __salvage_ok: ok, ...row } = hit;
-		if (typeof rowid !== "number" || !Number.isSafeInteger(rowid)) return "end";
+		if (typeof rowid !== "string") return "damaged";
+		const parsedRowid = BigInt(rowid);
 		// A cross-linked page can surface rowids out of order; treat that as damage so the scan always advances.
 		if (
-			(stmt === nextStmt && rowid <= origin) ||
-			(stmt === topStmt && rowid > origin) ||
-			(stmt === prevStmt && rowid >= origin)
+			(stmt === nextStmt && parsedRowid <= origin) ||
+			(stmt === topStmt && parsedRowid > origin) ||
+			(stmt === prevStmt && parsedRowid >= origin)
 		)
 			return "damaged";
-		return { rowid, ok: ok === 1, row };
+		return { rowid: parsedRowid, ok: ok === 1, row };
 	};
 
-	const kept: { rowid: number; row: Record<string, unknown> }[] = [];
-	const seen = new Set<number>();
+	const kept: { rowid: bigint; row: Record<string, unknown> }[] = [];
+	const seen = new Set<bigint>();
 	const keep = (seek: SalvageSeek): void => {
 		if (typeof seek !== "object" || seen.has(seek.rowid)) return;
 		seen.add(seek.rowid);
@@ -512,8 +530,8 @@ export function readDamagedSqliteRows<T>(
 	// with `rowid <=`/`rowid <` seeks. `deadBoundary` marks an interval whose
 	// entry boundary is a dead probe origin; the sweep skips its entry seek and
 	// starts probing.
-	const pending: Array<[lo: number, hi: number, deadBoundary: boolean, dir: 1 | -1]> = [
-		[Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, false, 1],
+	const pending: Array<[lo: bigint, hi: bigint, deadBoundary: boolean, dir: 1 | -1]> = [
+		[MIN_SQLITE_ROWID, MAX_SQLITE_ROWID, false, 1],
 	];
 	while (pending.length > 0) {
 		const [lo, hi, deadBoundary, dir] = pending.pop()!;
@@ -533,18 +551,15 @@ export function readDamagedSqliteRows<T>(
 				// of every probe the forward anchor below can reach, so that span
 				// goes to a descending sweep before probing; it self-terminates when
 				// the table holds no negatives.
-				if (origin < 0 && Math.min(0, hi) > origin) {
-					pending.push([origin, Math.min(0, hi), false, -1]);
+				if (origin < 0n && (hi > 0n ? 0n : hi) > origin) {
+					pending.push([origin, hi > 0n ? 0n : hi, false, -1]);
 				}
 				// Probe forward; a skipped interval goes on the worklist only when
 				// the probe found a live row inside it.
 				let skipped = origin;
 				let resumed = false;
-				for (let step = 1; ; step *= 2) {
-					// A damaged leftmost leaf fails every descent, so probing
-					// negative origins would only burn the doubling budget - anchor
-					// at 0 and let the doubling take over.
-					const probe = Math.min(skipped < 0 ? Math.max(0, skipped + step) : skipped + step, hi);
+				for (let step = 1n; ; step *= 2n) {
+					const probe = probeAt(skipped < 0n ? 0n : skipped, step, hi);
 					// A row at `probe` itself can sit on a readable leaf while every
 					// `rowid >` path to it routes through damage.
 					const exact = read(exactStmt, probe);
@@ -555,8 +570,8 @@ export function readDamagedSqliteRows<T>(
 						(typeof hit === "object" && hit.rowid > skipped && hit.rowid <= hi);
 					// A width-1 gap holds only the dead probe's own origin, and an
 					// entry that is not a strict sub-interval would requeue itself.
-					if (probe > skipped + 1 && (skipped > lo || probe < hi) && liveInRange) {
-						pending.push([skipped, probe, true, 1]);
+					if (probe > skipped + 1n && (skipped > lo || probe < hi) && liveInRange) {
+						pending.push([skipped, probe - 1n, true, 1]);
 					}
 					if (hit === "damaged") {
 						if (probe === hi) break;
@@ -591,16 +606,16 @@ export function readDamagedSqliteRows<T>(
 			// same doubling, exact-seek, and strict-sub-interval rules.
 			let floor = ceiling;
 			let resumed = false;
-			for (let step = 1; ; step *= 2) {
-				const probe = Math.max(floor - step, lo);
+			for (let step = 1n; ; step *= 2n) {
+				const probe = probeAt(floor, -step, lo);
 				const exact = read(exactStmt, probe);
 				keep(exact);
 				const hit = read(prevStmt, probe);
 				const liveInRange =
 					(typeof exact === "object" && exact.rowid > lo && exact.rowid < floor) ||
 					(typeof hit === "object" && hit.rowid > lo && hit.rowid < floor);
-				if (probe < floor - 1 && (floor < hi || probe > lo) && liveInRange) {
-					pending.push([probe, floor, true, -1]);
+				if (probe < floor - 1n && (floor < hi || probe > lo) && liveInRange) {
+					pending.push([probe + 1n, floor, true, -1]);
 				}
 				if (hit === "damaged") {
 					if (probe === lo) break;
@@ -618,7 +633,7 @@ export function readDamagedSqliteRows<T>(
 			if (!resumed) break;
 		}
 	}
-	kept.sort((a, b) => a.rowid - b.rowid);
+	kept.sort((a, b) => (a.rowid < b.rowid ? -1 : a.rowid > b.rowid ? 1 : 0));
 	return { rows: kept.map(entry => entry.row as T), damagedRegions };
 }
 

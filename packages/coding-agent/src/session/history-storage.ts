@@ -49,6 +49,8 @@ type HistoryRow = {
 	use_count: number;
 };
 
+type SalvagedHistoryRow = Omit<HistoryRow, "id"> & { id: string };
+
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
 /**
@@ -95,32 +97,37 @@ function normalizePrompt(prompt: string): string {
  * (the upsert's "latest provenance" rule) and every collapsed row's use count
  * is summed, since each was a submission.
  */
-function collapseByPrompt(rows: HistoryRow[]): HistoryRow[] {
-	const winners = new Map<string, HistoryRow>();
+function collapseByPrompt(rows: Array<HistoryRow | SalvagedHistoryRow>): SalvagedHistoryRow[] {
+	const winners = new Map<string, SalvagedHistoryRow>();
 	for (const row of rows) {
 		const prompt = normalizePrompt(row.prompt);
 		if (!prompt) continue;
 		const incumbent = winners.get(prompt);
 		if (!incumbent) {
-			winners.set(prompt, { ...row, prompt });
+			winners.set(prompt, { ...row, id: String(row.id), prompt });
 			continue;
 		}
 		const useCount = incumbent.use_count + row.use_count;
 		const rowWins =
-			row.created_at > incumbent.created_at || (row.created_at === incumbent.created_at && row.id > incumbent.id);
-		winners.set(prompt, rowWins ? { ...row, prompt, use_count: useCount } : { ...incumbent, use_count: useCount });
+			row.created_at > incumbent.created_at ||
+			(row.created_at === incumbent.created_at && BigInt(row.id) > BigInt(incumbent.id));
+		winners.set(
+			prompt,
+			rowWins ? { ...row, id: String(row.id), prompt, use_count: useCount } : { ...incumbent, use_count: useCount },
+		);
 	}
 	return [...winners.values()];
 }
 
 /** Selects the canonical row columns, defaulting those that predate `session_id` and `use_count`. */
-function historyRowColumns(db: Database): string {
+function historyRowColumns(db: Database, losslessId = false): string {
 	const names = new Set(
 		(db.query("PRAGMA table_info(history)").all() as Array<{ name: string }>).map(col => col.name),
 	);
+	const id = losslessId ? "CAST(id AS TEXT) AS id" : "id";
 	const sessionId = names.has("session_id") ? "session_id" : "NULL AS session_id";
 	const useCount = names.has("use_count") ? "use_count" : "1 AS use_count";
-	return `id, prompt, created_at, cwd, ${sessionId}, ${useCount}`;
+	return `${id}, prompt, created_at, cwd, ${sessionId}, ${useCount}`;
 }
 
 /** Keep the allocation high-water mark in SQLite's integer domain, including values above 2^53. */
@@ -589,11 +596,11 @@ ON CONFLICT(prompt) DO UPDATE SET
 				if (readVersion() >= HISTORY_DATA_VERSION) return;
 				assertSqliteQuickCheck(this.#db);
 				const highWater = readHistorySequence(this.#db);
-				let rows: HistoryRow[];
+				let rows: SalvagedHistoryRow[];
 				try {
 					rows = this.#db
-						.query(`SELECT ${historyRowColumns(this.#db)} FROM history WHERE ${wellFormedRowClause("")}`)
-						.all() as HistoryRow[];
+						.query(`SELECT ${historyRowColumns(this.#db, true)} FROM history WHERE ${wellFormedRowClause("")}`)
+						.all() as SalvagedHistoryRow[];
 				} catch (error) {
 					if (isSqliteCorruptionError(error)) throw error;
 					logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
@@ -631,7 +638,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 * already wrote to the replacement store, and neither side's prompts may be
 	 * dropped.
 	 */
-	#insertRows(rows: HistoryRow[]): void {
+	#insertRows(rows: SalvagedHistoryRow[]): void {
 		const insert = this.#db.query(`
 INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count)
 VALUES (CASE WHEN EXISTS (SELECT 1 FROM history WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5, ?6)
@@ -685,7 +692,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 				return new Database(backupPath, { readonly: true });
 			}, undefined);
 			let highWater: string | null = null;
-			let history: { rows: HistoryRow[]; damagedRegions: number } = { rows: [], damagedRegions: 0 };
+			let history: { rows: SalvagedHistoryRow[]; damagedRegions: number } = { rows: [], damagedRegions: 0 };
 			let index: SalvagedSessionIndex | undefined;
 			let carried: Array<{ backup_path: string }> = [];
 			if (source) {
@@ -702,10 +709,10 @@ ON CONFLICT(prompt) DO UPDATE SET
 				highWater = readSource(() => readHistorySequence(backup), null);
 				history = readSource(
 					() =>
-						readDamagedSqliteRows<HistoryRow>(
+						readDamagedSqliteRows<SalvagedHistoryRow>(
 							backup,
 							"history",
-							historyRowColumns(backup),
+							historyRowColumns(backup, true),
 							wellFormedRowClause(""),
 						),
 					history,

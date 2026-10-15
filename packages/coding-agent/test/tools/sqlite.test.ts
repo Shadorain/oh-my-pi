@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getHistoryDbPath, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import * as dirs from "@oh-my-pi/pi-utils/dirs";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { readSqlite } from "@oh-my-pi/pi-coding-agent/tools/read-sqlite";
@@ -137,6 +138,8 @@ function readUserByEmail(dbPath: string, email: string): { name: string; email: 
 }
 
 describe("SQLite tool support", () => {
+	afterEach(() => vi.restoreAllMocks());
+
 	let tmpDir: string;
 	let sqlitePath: string;
 	let sqliteDbPath: string;
@@ -346,12 +349,11 @@ describe("SQLite tool support", () => {
 		expect(text).toContain("Third; note");
 	});
 
-	it("reads a history alias from a complete WAL snapshot and keeps raw queries read-only", async () => {
-		const originalDir = getAgentDir();
+	it("reads a history alias from WAL and keeps raw-query snapshots read-only", async () => {
 		const agentDir = path.join(tmpDir, "history-snapshot-agent");
 		await fs.mkdir(agentDir, { recursive: true });
-		setAgentDir(agentDir);
-		const dbPath = getHistoryDbPath();
+		const dbPath = path.join(agentDir, "history.db");
+		vi.spyOn(dirs, "getHistoryDbPath").mockReturnValue(dbPath);
 		const alias = path.join(tmpDir, "history-alias.db");
 		const writer = new Database(dbPath);
 		try {
@@ -361,6 +363,12 @@ describe("SQLite tool support", () => {
 			await fs.symlink(dbPath, alias);
 			const result = await readSqlite({ absolutePath: alias, sqliteSubPath: "entries", queryString: "" });
 			expect(getText(result)).toContain("committed in WAL");
+			const rawResult = await readSqlite({
+				absolutePath: alias,
+				sqliteSubPath: "",
+				queryString: "q=SELECT%20value%20FROM%20entries",
+			});
+			expect(getText(rawResult)).toContain("committed in WAL");
 			await expect(
 				readSqlite({
 					absolutePath: alias,
@@ -380,7 +388,6 @@ describe("SQLite tool support", () => {
 			expect(writer.query("SELECT value FROM entries").all()).toEqual([{ value: "committed in WAL" }]);
 		} finally {
 			writer.close();
-			setAgentDir(originalDir);
 		}
 	});
 

@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { TextPredictor } from "@oh-my-pi/pi-natives";
 import { pathToFileURL } from "node:url";
-import { Engine, type HistoryCursor } from "../src/predict/daemon";
+import { Engine, readCursor } from "../src/predict/daemon";
 
 function createHistory(dbPath: string, count: number, finalPrompt = `prompt ${count}`): void {
 	const db = new Database(dbPath);
@@ -20,7 +20,7 @@ function createHistory(dbPath: string, count: number, finalPrompt = `prompt ${co
 
 function engine(observe: (prompts: string[]) => Promise<void>): Engine {
 	const predictor = { observe, persist: async () => {} } as unknown as TextPredictor;
-	return new Engine("ngram", "", predictor, { historyId: 0 });
+	return new Engine("ngram", "", predictor, { historyId: "0" });
 }
 
 describe("text-predict history ingestion", () => {
@@ -48,7 +48,7 @@ describe("text-predict history ingestion", () => {
 			ingestion = instance.ingest(dbPath);
 			const observed = await firstBatchSeen;
 			expect(observed).toHaveLength(1_000);
-			expect(instance.cursor).toBe(0);
+			expect(instance.cursor).toBe("0");
 			createHistory(replacementPath, 1, "fresh low-id prompt");
 			const sqliteModule = pathToFileURL(path.resolve(import.meta.dir, "../../utils/src/sqlite.ts")).href;
 			const script = `import * as fs from "node:fs";
@@ -63,7 +63,7 @@ withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {
 			expect(fs.existsSync(`${dbPath}-shm`)).toBe(false);
 			releaseObserve();
 			expect(await ingestion).toBe(1_001);
-			expect(instance.cursor).toBe(1);
+			expect(instance.cursor).toBe("1");
 			expect(batches).toBe(2);
 		} finally {
 			releaseObserve();
@@ -89,9 +89,9 @@ withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {
 		});
 		try {
 			await expect(instance.ingest(dbPath)).rejects.toThrow("observe failed");
-			expect(instance.cursor).toBe(0);
+			expect(instance.cursor).toBe("0");
 			expect(await instance.ingest(dbPath)).toBe(1);
-			expect(instance.cursor).toBe(1);
+			expect(instance.cursor).toBe("1");
 			expect(seen).toEqual([["retry me"], ["retry me"]]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -108,12 +108,12 @@ withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {
 			seen.push(...prompts);
 		});
 		try {
-			expect(await instance.ingest(dbPath)).toBe(1_001);
+			expect(await instance.ingest(dbPath)).toBe(seen.length);
 			createHistory(replacementPath, 1, "fresh replacement prompt");
 			fs.renameSync(replacementPath, dbPath);
 			expect(await instance.ingest(dbPath)).toBe(1);
 			expect(seen.at(-1)).toBe("fresh replacement prompt");
-			expect(instance.cursor).toBe(1);
+			expect(instance.cursor).toBe("1");
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
@@ -132,16 +132,55 @@ withSqliteStoreLease(${JSON.stringify(dbPath)}, () => {
 			persist: async () => {},
 		} as unknown as TextPredictor;
 		try {
-			const first = new Engine("ngram", dir, predictor, { historyId: 0 });
+			const first = new Engine("ngram", dir, predictor, { historyId: "0" });
 			await first.ingest(dbPath);
 			await first.persist();
-			const checkpoint = (await Bun.file(path.join(dir, "cursor.json")).json()) as HistoryCursor;
+			const checkpoint = await readCursor(dir);
 			const restarted = new Engine("ngram", dir, predictor, checkpoint);
 			expect(await restarted.ingest(dbPath)).toBe(0);
 			createHistory(replacementPath, 1, "replacement prompt");
 			fs.renameSync(replacementPath, dbPath);
 			expect(await restarted.ingest(dbPath)).toBe(1);
 			expect(seen).toEqual(["already learned", "replacement prompt"]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps ids above JavaScript's safe range exact across persist and restart", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-predict-wide-cursor-"));
+		const dbPath = path.join(dir, "history.db");
+		const db = new Database(dbPath);
+		try {
+			db.run("CREATE TABLE history (id INTEGER PRIMARY KEY, prompt)");
+			db.run("INSERT INTO history VALUES (9007199254740993, 'wide cursor prompt')");
+		} finally {
+			db.close();
+		}
+		const seen: string[] = [];
+		const predictor = {
+			observe: async (prompts: string[]) => {
+				seen.push(...prompts);
+			},
+			persist: async () => {},
+		} as unknown as TextPredictor;
+		try {
+			const first = new Engine("ngram", dir, predictor, { historyId: "0" });
+			await first.ingest(dbPath);
+			expect(first.cursor).toBe("9007199254740993");
+			await first.persist();
+			expect((await Bun.file(path.join(dir, "cursor.json")).json()).historyId).toBe("9007199254740993");
+			const restarted = new Engine("ngram", dir, predictor, await readCursor(dir));
+			expect(await restarted.ingest(dbPath)).toBe(0);
+			const writer = new Database(dbPath);
+			try {
+				writer.run("INSERT INTO history VALUES (9007199254740994, 'next wide prompt')");
+			} finally {
+				writer.close();
+			}
+			expect(await restarted.ingest(dbPath)).toBe(1);
+			expect(restarted.cursor).toBe("9007199254740994");
+			expect(seen).toEqual(["wide cursor prompt", "next wide prompt"]);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

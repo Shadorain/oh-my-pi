@@ -73,14 +73,14 @@ async function waitForFile(filePath: string): Promise<void> {
 	if (fs.existsSync(filePath)) return;
 	const watcher = fs.watch(path.dirname(filePath));
 	try {
-		await new Promise<void>(resolve => {
-			const check = () => {
-				if (fs.existsSync(filePath)) resolve();
-			};
-			watcher.on("change", check);
-			watcher.on("rename", check);
+		const { promise: appeared, resolve } = Promise.withResolvers<void>();
+		const check = () => {
 			if (fs.existsSync(filePath)) resolve();
-		});
+		};
+		watcher.on("change", check);
+		watcher.on("rename", check);
+		check();
+		await appeared;
 	} finally {
 		watcher.close();
 	}

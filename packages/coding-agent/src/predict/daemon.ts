@@ -51,33 +51,40 @@ const WEIGHTS_RECHECK_MS = 5_000;
 const CURSOR_FILE = "cursor.json";
 
 export interface HistoryCursor {
-	historyId: number;
+	/** Decimal SQLite rowid; values above 2^53 stay exact. */
+	historyId: string;
 	historyIdentity?: string;
 }
 
+const HISTORY_ID_PATTERN = /^(?:0|[1-9]\d{0,19})$/;
+
+function parseHistoryCursorId(value: unknown): string {
+	if (typeof value === "string" && HISTORY_ID_PATTERN.test(value)) return value;
+	// Existing checkpoints predate decimal ids; migrate only values JS represented exactly.
+	if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+	return "0";
+}
+
 /** A legacy cursor without an identity re-ingests once rather than skipping a replacement's low ids. */
-async function readCursor(stateDir: string): Promise<HistoryCursor | undefined> {
+export async function readCursor(stateDir: string): Promise<HistoryCursor | undefined> {
 	try {
 		const raw: unknown = await Bun.file(path.join(stateDir, CURSOR_FILE)).json();
-		if (
-			typeof raw === "object" &&
-			raw !== null &&
-			"historyId" in raw &&
-			typeof raw.historyId === "number" &&
-			Number.isSafeInteger(raw.historyId) &&
-			raw.historyId >= 0
-		) {
+		const historyId =
+			typeof raw === "object" && raw !== null && "historyId" in raw
+				? parseHistoryCursorId(raw.historyId)
+				: undefined;
+		if (historyId !== undefined) {
 			return {
-				historyId: raw.historyId,
+				historyId,
 				historyIdentity:
 					"historyIdentity" in raw && typeof raw.historyIdentity === "string" ? raw.historyIdentity : undefined,
 			};
 		}
-		return { historyId: 0 };
+		return { historyId: "0" };
 	} catch (error) {
 		if (isEnoent(error)) return undefined;
 		logger.warn("text-predict: unreadable history cursor; re-ingesting", { stateDir, error: String(error) });
-		return { historyId: 0 };
+		return { historyId: "0" };
 	}
 }
 
@@ -133,11 +140,11 @@ export class PersistCadence {
 /** One open engine plus the history position its persisted state covers. */
 export class Engine {
 	/** Highest `history.id` fed to `observe`. */
-	cursor: number;
+	cursor: string;
 	/** Foreign prompt histories still owed to empty state (see {@link readForeignPrompts}). */
 	#seed: boolean;
 	/** Cursor value covered by the last successful persist. */
-	#persistedCursor: number;
+	#persistedCursor: string;
 	#historyIdentity?: string;
 	#persistedIdentity?: string;
 	#dirty = false;
@@ -149,7 +156,7 @@ export class Engine {
 		readonly predictor: TextPredictor,
 		checkpoint: HistoryCursor | undefined,
 	) {
-		this.cursor = checkpoint?.historyId ?? 0;
+		this.cursor = parseHistoryCursorId(checkpoint?.historyId);
 		this.#historyIdentity = checkpoint?.historyIdentity;
 		this.#persistedIdentity = this.#historyIdentity;
 		this.#persistedCursor = this.cursor;
@@ -204,17 +211,17 @@ export class Engine {
 			ingested += prompts.length;
 		}
 		for (;;) {
-			let batch: { rows: Array<{ id: number; prompt: string }>; identity: string; cursor: number };
+			let batch: { rows: Array<{ id: string; prompt: string }>; identity: string; cursor: string };
 			try {
 				batch = withSqliteStoreLease(historyDbPath, () => {
 					const db = openSqliteReadConnectionSync(historyDbPath);
 					try {
 						const identity = sqliteFileIdentity(historyDbPath);
 						if (typeof identity !== "string") throw new Error("Could not identify the history store");
-						const cursor = identity === this.#historyIdentity ? this.cursor : 0;
+						const cursor = identity === this.#historyIdentity ? this.cursor : "0";
 						const rows = db
-							.query<{ id: number; prompt: string }, [number, number]>(
-								"SELECT id, prompt FROM history WHERE id > ? AND typeof(prompt) = 'text' ORDER BY id LIMIT ?",
+							.query<{ id: string; prompt: string }, [string, number]>(
+								"SELECT CAST(id AS TEXT) AS id, prompt FROM history WHERE id > CAST(? AS INTEGER) AND typeof(prompt) = 'text' ORDER BY id LIMIT ?",
 							)
 							.all(cursor, INGEST_BATCH);
 						return { rows, identity, cursor };

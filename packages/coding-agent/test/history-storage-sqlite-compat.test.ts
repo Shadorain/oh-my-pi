@@ -869,6 +869,52 @@ it("preserves a sequence above the JavaScript safe integer range without roundin
 	}
 });
 
+it("salvages high-id rows losslessly and preserves allocation order after recovery", async () => {
+	tempDir = TempDir.createSync("@omp-history-wide-salvage-");
+	const dbPath = tempDir.join("history.db");
+	const backup = new Database(dbPath);
+	backup.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			prompt TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			cwd TEXT,
+			session_id TEXT,
+			use_count INTEGER NOT NULL DEFAULT 1
+		);
+		INSERT INTO history (id, prompt, created_at, use_count) VALUES
+			(9007199254740993, 'first wide prompt', 1, 1),
+			(9007199254740995, 'second wide prompt', 2, 1);
+		UPDATE sqlite_sequence SET seq=9007199254740995 WHERE name='history';
+		PRAGMA user_version = 2;
+	`);
+	backup.close();
+	fs.copyFileSync(dbPath, tempDir.join("history.db.corrupt-wide"));
+	fs.writeFileSync(`${dbPath}.pending-salvage`, JSON.stringify([{ backupName: "history.db.corrupt-wide" }]));
+	// A different generation can write while the high-id source waits.
+	await HistoryStorage.open(dbPath).add("live prompt");
+	HistoryStorage.close();
+	fs.copyFileSync(tempDir.join("history.db.corrupt-wide"), tempDir.join("history.db.corrupt-deferred"));
+	fs.writeFileSync(`${dbPath}.pending-salvage`, JSON.stringify([{ backupName: "history.db.corrupt-deferred" }]));
+	const storage = HistoryStorage.open(dbPath);
+	await storage.add("next prompt");
+	const check = new Database(dbPath, { readonly: true });
+	try {
+		expect(
+			check
+				.query<{ id: string; prompt: string }, []>("SELECT CAST(id AS TEXT) AS id, prompt FROM history ORDER BY id")
+				.all(),
+		).toEqual([
+			{ id: "9007199254740993", prompt: "first wide prompt" },
+			{ id: "9007199254740995", prompt: "second wide prompt" },
+			{ id: "9007199254740998", prompt: "live prompt" },
+			{ id: "9007199254741001", prompt: "next prompt" },
+		]);
+	} finally {
+		check.close();
+	}
+});
+
 it("preserves a deferred older source while recovering a newly damaged replacement", async () => {
 	tempDir = TempDir.createSync("@omp-history-multiple-generations-");
 	const dbPath = tempDir.join("history.db");

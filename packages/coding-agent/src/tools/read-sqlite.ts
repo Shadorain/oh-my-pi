@@ -209,29 +209,39 @@ export async function readSqlite(
 	};
 
 	try {
-		// Snapshot only while leased: arbitrary raw SQL must not hold the
-		// recovery lock long enough to make prompt persistence time out.
+		// Bounded selectors do not need a full-store copy. Arbitrary raw SQL
+		// runs off-lease so it cannot starve prompt persistence.
 		if (
 			normalizePathForComparison(resolvedSqlitePath.absolutePath, { allowMissing: true }) ===
 			normalizePathForComparison(getHistoryDbPath(), { allowMissing: true })
 		) {
-			const snapshot = withSqliteStoreLease(resolvedSqlitePath.absolutePath, () => {
+			if (selector.kind === "raw") {
+				const snapshot = withSqliteStoreLease(resolvedSqlitePath.absolutePath, () => {
+					const db = openSqliteReadConnectionSync(resolvedSqlitePath.absolutePath);
+					try {
+						return db.serialize();
+					} finally {
+						db.close();
+					}
+				});
+				// A deserialized database has no WAL sidecars; keep the serialized
+				// pages but switch its file-format read/write versions to rollback mode.
+				snapshot[18] = snapshot[19] = 1;
+				const db = configureSqliteReadConnection(Database.deserialize(snapshot, { readonly: true, strict: true }));
+				try {
+					return renderResult(db);
+				} finally {
+					db.close();
+				}
+			}
+			return withSqliteStoreLease(resolvedSqlitePath.absolutePath, () => {
 				const db = openSqliteReadConnectionSync(resolvedSqlitePath.absolutePath);
 				try {
-					return db.serialize();
+					return renderResult(db);
 				} finally {
 					db.close();
 				}
 			});
-			// A deserialized database has no WAL sidecars; keep the serialized
-			// pages but switch its file-format read/write versions to rollback mode.
-			snapshot[18] = snapshot[19] = 1;
-			const db = configureSqliteReadConnection(Database.deserialize(snapshot, { readonly: true, strict: true }));
-			try {
-				return renderResult(db);
-			} finally {
-				db.close();
-			}
 		}
 		const db = await openSqliteReadConnection(resolvedSqlitePath.absolutePath);
 		try {
