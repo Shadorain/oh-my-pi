@@ -13,7 +13,6 @@ import {
 	resolveEquivalentPath,
 	sqliteFileIdentity,
 	withSqliteStoreLease,
-	type SqliteFileIdentity,
 } from "@oh-my-pi/pi-utils";
 import { writeFileAtomicallySync } from "../utils/atomic-file";
 import { readSalvagedSessionIndex, restoreSalvagedSessionIndex, type SalvagedSessionIndex } from "./session-index";
@@ -159,6 +158,12 @@ function compareRowIds(a: string, b: string): number {
 	const right = BigInt(b);
 	return left < right ? -1 : left > right ? 1 : 0;
 }
+
+/** A journaled backup was queued after the pre-lease scan; rescan without holding the lease. */
+class HistorySalvageRescan extends Error {}
+
+/** Restart cycles a drain can trigger before deferring freshly queued backups to the next open. */
+const MAX_SALVAGE_RESCANS = 4;
 
 /** Backup contents plus the ledger rows it carries; scanned without the store lease. */
 interface HistorySalvageScan {
@@ -417,14 +422,15 @@ ON CONFLICT(prompt) DO UPDATE SET
 
 	#withStore<T>(operation: () => T): T {
 		if (this.#closed) throw new Error("HistoryStorage is closed");
-		for (let attempt = 0; ; attempt++) {
-			// Backup scans never hold the lease or a live handle: they only read
-			// immutable quarantined files, and on Windows an open handle would
-			// defeat a peer's unlink of the corrupt store. The scan set is then
-			// drained under the lease against a freshly read journal, so entries
-			// a peer queued during the scans are scanned inline and applied.
-			const scanned = this.#scanPendingSalvage();
+		// Backup scans never hold the lease or a live handle: they only read
+		// immutable quarantined files, and on Windows an open handle would
+		// defeat a peer's unlink of the corrupt store. The drain re-reads the
+		// journal under the lease; a record a peer queued after our scan throws
+		// out to an unlocked rescan instead of walking a backup under the lease.
+		const scanned = new Map<string, HistorySalvageScan | undefined>();
+		for (let attempt = 0, rescans = 0; ; attempt++) {
 			try {
+				this.#scanPendingSalvage(scanned);
 				return withSqliteStoreLease(this.#dbPath, () => {
 					const db = openSqliteDatabaseSync(
 						this.#dbPath,
@@ -452,11 +458,14 @@ ON CONFLICT(prompt) DO UPDATE SET
 									clearPendingSalvage(this.#dbPath, record.backupName);
 									continue;
 								}
-								const backupPath = path.join(path.dirname(this.#dbPath), record.backupName);
-								const scan = scanned.has(record.backupName)
-									? scanned.get(record.backupName)
-									: this.#scanBackup(backupPath);
-								if (!scan) break;
+								const scan = scanned.get(record.backupName);
+								if (!scan) {
+									// Never scanned, or a prior scan deferred. Peers queuing
+									// faster than we rescan get a bounded retry, then the
+									// operation runs with the entries still journaled.
+									if (rescans >= MAX_SALVAGE_RESCANS) continue;
+									throw new HistorySalvageRescan();
+								}
 								try {
 									this.#applySalvageScan(scan);
 								} catch (error) {
@@ -478,6 +487,10 @@ ON CONFLICT(prompt) DO UPDATE SET
 					}
 				});
 			} catch (error) {
+				if (error instanceof HistorySalvageRescan) {
+					rescans++;
+					continue;
+				}
 				// The open-time check is generation-gated, so damage done after
 				// that scan first surfaces as an operation error. Invalidate the
 				// generation proof and retry once: the re-scan recovers a corrupt
@@ -489,25 +502,25 @@ ON CONFLICT(prompt) DO UPDATE SET
 	}
 
 	/**
-	 * Snapshots every recoverable journaled backup, newest first, stopping at
-	 * the first deferral. Runs without the lease and without a live handle:
+	 * Fills `scans` with snapshots of every recoverable journaled backup,
+	 * newest first, stopping at the first deferral; good scans from earlier
+	 * cycles are kept. Runs without the lease and without a live handle:
 	 * scans hold only read handles on immutable quarantined files, so a large
 	 * damaged backup cannot serialize the store's other participants, and no
 	 * connection of ours can block a peer's quarantine unlink on Windows.
 	 * `undefined` map entries mark backups that were read and deferred.
 	 */
-	#scanPendingSalvage(): Map<string, HistorySalvageScan | undefined> {
+	#scanPendingSalvage(scans: Map<string, HistorySalvageScan | undefined>): void {
 		const pending = readPendingSalvage(this.#dbPath);
-		const scans = new Map<string, HistorySalvageScan | undefined>();
 		// A newer snapshot carries the ledger of older committed backups.
 		// Do not replay older entries until that ledger has been restored.
 		for (let i = pending.length - 1; i >= 0; i--) {
-			const backupPath = path.join(path.dirname(this.#dbPath), pending[i].backupName);
-			const scan = this.#scanBackup(backupPath);
-			scans.set(pending[i].backupName, scan);
+			const name = pending[i].backupName;
+			if (scans.get(name)) continue;
+			const scan = this.#scanBackup(path.join(path.dirname(this.#dbPath), name));
+			scans.set(name, scan);
 			if (!scan) break;
 		}
-		return scans;
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>): void {
@@ -755,7 +768,17 @@ ON CONFLICT(prompt) DO UPDATE SET
 	#insertRows(rows: SalvagedHistoryRow[]): void {
 		const insert = this.#db.query(`
 INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count)
-VALUES (CASE WHEN EXISTS (SELECT 1 FROM history WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5, ?6)
+VALUES (
+	CASE WHEN EXISTS (SELECT 1 FROM history WHERE id = ?1)
+		THEN (SELECT candidate FROM (
+			SELECT h.id + 1 AS candidate FROM history h
+			WHERE h.id > 0 AND h.id < 9223372036854775807
+				AND NOT EXISTS (SELECT 1 FROM history h2 WHERE h2.id = h.id + 1)
+			UNION ALL
+			SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM history WHERE id = 1)
+		) ORDER BY candidate LIMIT 1)
+		ELSE ?1 END,
+	?2, ?3, ?4, ?5, ?6)
 ON CONFLICT(prompt) DO UPDATE SET
 	use_count = history.use_count + excluded.use_count,
 	created_at = max(history.created_at, excluded.created_at),
@@ -861,9 +884,12 @@ ON CONFLICT(prompt) DO UPDATE SET
 		this.#db
 			.transaction(() => {
 				if (applied.get(scan.backupName)) return;
-				restoreHistorySequence(this.#db, scan.highWater);
 				this.#insertRows(scan.history);
 				if (scan.index) restoreSalvagedSessionIndex(scan.index, this.#db);
+				// Sequence last: a collision remap above picks a free id below the
+				// water mark, which an earlier restore would skip past and send
+				// the AUTOINCREMENT fallback into SQLITE_FULL at INT64_MAX.
+				restoreHistorySequence(this.#db, scan.highWater);
 				const mark = this.#db.query("INSERT OR IGNORE INTO history_salvage_applied (backup_path) VALUES (?)");
 				for (const name of scan.carried) mark.run(name);
 				mark.run(scan.backupName);

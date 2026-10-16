@@ -953,8 +953,58 @@ it("salvages high-id rows losslessly and preserves allocation order after recove
 		).toEqual([
 			{ id: "9007199254740993", prompt: "first wide prompt" },
 			{ id: "9007199254740995", prompt: "second wide prompt" },
-			{ id: "9007199254740998", prompt: "live prompt" },
-			{ id: "9007199254741001", prompt: "next prompt" },
+			{ id: "9007199254740996", prompt: "live prompt" },
+			{ id: "9007199254740997", prompt: "next prompt" },
+		]);
+	} finally {
+		check.close();
+	}
+});
+it("remaps a salvaged id colliding at the AUTOINCREMENT ceiling instead of failing open", async () => {
+	tempDir = TempDir.createSync("@omp-history-maxid-salvage-");
+	const dbPath = tempDir.join("history.db");
+	await HistoryStorage.open(dbPath).add("live prompt");
+	HistoryStorage.close();
+
+	// A peer claim at the last rowid: the live row keeps INT64_MAX, and the
+	// backup carries a different prompt with the same id plus a maxed sequence.
+	const raw = new Database(dbPath);
+	raw.run("UPDATE history SET id = 9223372036854775807 WHERE prompt = 'live prompt'");
+	raw.close();
+	const backupPath = tempDir.join("history.db.corrupt-maxid");
+	const backup = new Database(backupPath);
+	backup.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			prompt TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			cwd TEXT,
+			session_id TEXT,
+			use_count INTEGER NOT NULL DEFAULT 1
+		);
+		INSERT INTO history (id, prompt, created_at, use_count) VALUES
+			(9223372036854775807, 'stranded at the top', 1, 1);
+		UPDATE sqlite_sequence SET seq = 9223372036854775807 WHERE name = 'history';
+	`);
+	backup.close();
+	fs.writeFileSync(`${dbPath}.pending-salvage`, JSON.stringify([{ backupName: path.basename(backupPath) }]));
+
+	const storage = HistoryStorage.open(dbPath);
+	// Recency order: the live row's epoch timestamp outranks the salvaged row's fixture value.
+	expect(storage.getRecent(10).map(entry => entry.prompt)).toEqual(["live prompt", "stranded at the top"]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+	HistoryStorage.close();
+
+	const check = new Database(dbPath, { readonly: true });
+	try {
+		const rows = check
+			.query<{ id: string; prompt: string }, []>(
+				"SELECT CAST(id AS TEXT) AS id, prompt FROM history ORDER BY prompt",
+			)
+			.all();
+		expect(rows).toEqual([
+			{ id: "9223372036854775807", prompt: "live prompt" },
+			{ id: "1", prompt: "stranded at the top" },
 		]);
 	} finally {
 		check.close();
