@@ -380,6 +380,23 @@ const CANCEL_RUN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const CANCEL_RUN_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a cancelled POSIX run's processes get to finish TERM cleanup
+/// (traps, lock/marker removal) before the KILL wave.
+#[cfg(unix)]
+const TERM_GRACE: Duration = Duration::from_secs(1);
+
+/// Delay between cancellation and cancelling the output readers. Readers stay
+/// open so pipeline consumers can flush after their producers die, and so a
+/// TERM trap that writes output during [`TERM_GRACE`] does not hit EPIPE and
+/// die before finishing its cleanup. Windows needs a wider budget for the same
+/// reason as `CANCEL_RUN_GRACE`: the consumer's flush depends on the
+/// producer's exit becoming visible through several thread wakeups. The
+/// delayed fallback still releases readers whose writers never close.
+#[cfg(windows)]
+const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
+#[cfg(not(windows))]
+const CANCEL_READER_GRACE: Duration = Duration::from_millis(1250);
+
 async fn run_shell_session(
 	session: Arc<TokioMutex<Option<ShellSessionCore>>>,
 	abort_state: ShellAbortState,
@@ -1381,16 +1398,6 @@ async fn run_shell_command_once(
 			}
 		}
 	});
-	// Let pipeline consumers flush output after cancellation kills their
-	// producers. The outer run cancellation remains bounded, and this delayed
-	// fallback still releases readers whose writers never close. Windows needs
-	// a wider budget for the same reason as `CANCEL_RUN_GRACE`: the consumer's
-	// flush depends on the producer's exit becoming visible through several
-	// thread wakeups.
-	#[cfg(windows)]
-	const CANCEL_READER_GRACE: Duration = Duration::from_millis(2000);
-	#[cfg(not(windows))]
-	const CANCEL_READER_GRACE: Duration = Duration::from_millis(500);
 	let cancel_bridge = tokio::spawn({
 		let cancel_token = cancel_token.clone();
 		let reader_cancel = reader_cancel.clone();
@@ -1546,6 +1553,7 @@ async fn run_shell_command_streams_in_filesystem(
 		let reader_cancel = reader_cancel.clone();
 		async move {
 			cancel_token.cancelled().await;
+			time::sleep(CANCEL_READER_GRACE).await;
 			reader_cancel.cancel();
 		}
 	});
@@ -1743,11 +1751,15 @@ async fn terminate_run(registry: &process::SpawnRegistry) {
 	}
 }
 
+#[cfg_attr(
+	not(unix),
+	expect(clippy::unused_async, reason = "the TERM grace wait only awaits on unix")
+)]
 async fn wait_for_term_grace(registry: &process::SpawnRegistry) {
 	// Windows TERM is already hard termination; there is no trap to wait for.
 	#[cfg(unix)]
 	{
-		let deadline = time::Instant::now() + Duration::from_secs(1);
+		let deadline = time::Instant::now() + TERM_GRACE;
 		while !registry.build_targets().is_empty() {
 			let now = time::Instant::now();
 			if now >= deadline {
@@ -6975,6 +6987,55 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 			.expect("shell result");
 		assert!(result.cancelled);
 		assert_eq!(fs::read_to_string(root.path().join("cleaned")).expect("TERM cleanup"), "cleaned");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cancellation_keeps_output_open_for_a_term_trap_that_writes() {
+		let _guard = shell_test_lock().lock().await;
+		let root = tempfile::tempdir().expect("cleanup directory");
+		fs::write(
+			root.path().join("cleanup.sh"),
+			"trap 'sleep 0.7; echo flushing; printf cleaned > cleaned; exit 0' TERM\n: > \
+			 ready\nwhile :; do :; done\n",
+		)
+		.expect("cleanup script");
+		let shell = Shell::new(None);
+		let mut cancel = CancelToken::default();
+		let abort = cancel.emplace_abort_token();
+		let cwd = root.path().to_str().expect("utf8 cwd").to_owned();
+		let task = tokio::spawn(async move {
+			shell
+				.run(
+					ShellRunOptions {
+						command: "sh cleanup.sh".into(),
+						cwd: Some(cwd),
+						..Default::default()
+					},
+					None,
+					cancel,
+				)
+				.await
+		});
+		time::timeout(Duration::from_secs(5), async {
+			while !root.path().join("ready").exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("child ready");
+		abort.abort(AbortReason::Signal);
+		let result = time::timeout(Duration::from_secs(5), task)
+			.await
+			.expect("cancel finished")
+			.expect("run task")
+			.expect("shell result");
+		assert!(result.cancelled);
+		assert_eq!(
+			fs::read_to_string(root.path().join("cleaned"))
+				.expect("TERM cleanup after writing output"),
+			"cleaned"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

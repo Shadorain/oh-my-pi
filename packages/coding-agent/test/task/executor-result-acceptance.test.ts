@@ -470,6 +470,50 @@ describe("runSubprocess result acceptance", () => {
 		}
 	});
 
+	it("keeps the accepted artifact and sidecar when the parent cancels its wake job before finalization", async () => {
+		const tempDir = TempDir.createSync("@omp-cancelled-wake-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const accepted = '{"report":"accepted verdict"}';
+
+		try {
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "recheck",
+					display: false,
+					details: { id: "msg-owner", from: "Parent", message: "recheck" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			harness.emitAssistantText("cancelled answer");
+			expect(manager.cancel(AGENT_ID)).toBe(true);
+			await finish?.(undefined);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
+			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
 	it("keeps the accepted artifact and sidecar when an unstructured follow-up starts aborted", async () => {
 		const tempDir = TempDir.createSync("@omp-aborted-agent-result-");
 		const artifactsDir = tempDir.path();

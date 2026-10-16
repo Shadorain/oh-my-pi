@@ -1,10 +1,13 @@
 /**
  * Decode a response body honoring the declared charset (Content-Type header,
- * then a cheap <meta charset> sniff), falling back to UTF-8.
+ * then, for HTML or untyped bodies, a cheap <meta charset> sniff), falling
+ * back to UTF-8.
  */
 export function decodeBody(bytes: Buffer, contentTypeHeader: string): string {
 	let label = /charset\s*=\s*"?([\w-]+)"?/i.exec(contentTypeHeader)?.[1];
-	if (!label) {
+	// A JSON or text payload may quote a `<meta charset>` tag as data; only an
+	// HTML document's own markup declares its encoding that way.
+	if (!label && (contentTypeHeader.trim() === "" || /html/i.test(contentTypeHeader))) {
 		// All charsets we can decode are ASCII-compatible in the prefix, so a
 		// latin1 view of the first 2KB is enough to find a <meta charset>.
 		label = /<meta[^>]+charset\s*=\s*["']?([\w-]+)/i.exec(bytes.subarray(0, 2048).toString("latin1"))?.[1];
@@ -34,8 +37,10 @@ export async function readBodyCapped(
 	const reader = response.body?.getReader();
 	if (!reader) return null;
 
-	const chunks: Uint8Array[] = [];
-	let totalSize = 0;
+	// One buffer grown up to the cap: a body delivered as many tiny (or empty)
+	// chunks must not retain one object per chunk.
+	let buffer = new Uint8Array(Math.min(maxBytes, 64 * 1024));
+	let size = 0;
 	let truncated = false;
 
 	try {
@@ -43,29 +48,25 @@ export async function readBodyCapped(
 			const { done, value } = await reader.read();
 			if (done) break;
 
-			const accepted = Math.min(value.byteLength, maxBytes - totalSize);
+			const accepted = Math.min(value.byteLength, maxBytes - size);
+			if (size + accepted > buffer.byteLength) {
+				const grown = new Uint8Array(Math.min(maxBytes, Math.max(size + accepted, buffer.byteLength * 2)));
+				grown.set(buffer.subarray(0, size));
+				buffer = grown;
+			}
+			buffer.set(value.subarray(0, accepted), size);
+			size += accepted;
 			if (accepted < value.byteLength) {
-				// Crossing chunk: keep the head up to the cap, mark the body cut
-				// and stop reading so an oversized response cannot balloon memory.
-				if (accepted > 0) {
-					chunks.push(value.subarray(0, accepted));
-					totalSize += accepted;
-				}
+				// Crossing chunk: keep the head up to the cap, mark the body cut and
+				// stop reading so an oversized response cannot balloon memory.
 				truncated = true;
 				await reader.cancel().catch(() => undefined);
 				break;
 			}
-			chunks.push(value);
-			totalSize += accepted;
 		}
 	} finally {
 		reader.releaseLock();
 	}
 
-	// A single chunk is decoded in place; only multi-chunk bodies need a concat copy.
-	const bytes =
-		chunks.length === 1
-			? Buffer.from(chunks[0].buffer, chunks[0].byteOffset, chunks[0].byteLength)
-			: Buffer.concat(chunks, totalSize);
-	return { bytes, truncated };
+	return { bytes: Buffer.from(buffer.buffer, buffer.byteOffset, size), truncated };
 }

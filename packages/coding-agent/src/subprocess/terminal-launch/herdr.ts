@@ -35,14 +35,12 @@ const shellNeutralWord = /^[A-Za-z0-9_./-]+$/;
 
 /**
  * `herdr pane run` types text into the pane's interactive shell, whose grammar is unknown.
- * Typing only the absolute path of a self-deleting `/bin/sh` script keeps argv exact in any shell.
+ * Typing only `/bin/sh` and the absolute path of a self-deleting script keeps argv exact in any
+ * shell; invoking it through `/bin/sh` works even when the temp mount is `noexec`. The script is
+ * written before the Herdr surface exists so a local failure leaves no orphaned pane or tab.
  */
-async function runInPane(
-	request: TerminalLaunchRequest,
-	paneId: string,
-	runCli: TerminalLaunchCliRunner,
-): Promise<void> {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-herdr-"));
+async function prepareLaunchScript(request: TerminalLaunchRequest): Promise<{ directory: string; typed: string }> {
+	const directory = await fs.mkdtemp(path.join(path.resolve(os.tmpdir()), "omp-herdr-"));
 	try {
 		const script = path.join(directory, "launch");
 		if (!shellNeutralWord.test(script)) {
@@ -52,12 +50,26 @@ async function runInPane(
 				"Herdr launch needs a temporary directory path made of letters, digits, and ./_- only.",
 			);
 		}
-		await fs.writeFile(
-			script,
-			`#!/bin/sh\nrm -rf -- ${quotePosixArgument(directory)}\nexec ${quotePosixArgv(request.command)}\n`,
-			{ mode: 0o700 },
-		);
-		await runStep(request, "pane run", ["herdr", "pane", "run", paneId, script], request.cwd, runCli);
+		// No `exec`: it would parse a command name starting with `-` as an option.
+		await Bun.write(script, `rm -rf -- ${quotePosixArgument(directory)}\n${quotePosixArgv(request.command)}\n`);
+		return { directory, typed: `/bin/sh ${script}` };
+	} catch (error) {
+		await fs.rm(directory, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+/** Creates the Herdr surface, then types the prepared launch line into its pane; returns the surface ID. */
+async function launchInNewSurface(
+	request: TerminalLaunchRequest,
+	runCli: TerminalLaunchCliRunner,
+	createSurface: () => Promise<{ id: string; paneId: string }>,
+): Promise<string> {
+	const { directory, typed } = await prepareLaunchScript(request);
+	try {
+		const { id, paneId } = await createSurface();
+		await runStep(request, "pane run", ["herdr", "pane", "run", paneId, typed], request.cwd, runCli);
+		return id;
 	} catch (error) {
 		await fs.rm(directory, { recursive: true, force: true });
 		throw error;
@@ -89,15 +101,17 @@ const launchHerdr: TerminalLaunchBackend<"herdr", typeof capabilities> = async (
 			request.cwd,
 			...focusArgs,
 		];
-		const created = parseJson(
-			request,
-			"pane split",
-			await runStep(request, "pane split", createArgv, request.cwd, runCli),
-		);
-		const paneId = nestedString(created, "result", "pane", "pane_id");
-		if (!paneId) throw launchError(request, "pane split", "Herdr pane split returned no pane ID.");
-		await runInPane(request, paneId, runCli);
-		return { multiplexer: "herdr", placement: "pane", id: paneId };
+		const id = await launchInNewSurface(request, runCli, async () => {
+			const created = parseJson(
+				request,
+				"pane split",
+				await runStep(request, "pane split", createArgv, request.cwd, runCli),
+			);
+			const paneId = nestedString(created, "result", "pane", "pane_id");
+			if (!paneId) throw launchError(request, "pane split", "Herdr pane split returned no pane ID.");
+			return { id: paneId, paneId };
+		});
+		return { multiplexer: "herdr", placement: "pane", id };
 	}
 
 	const workspace = request.target ?? env.HERDR_WORKSPACE_ID;
@@ -105,16 +119,18 @@ const launchHerdr: TerminalLaunchBackend<"herdr", typeof capabilities> = async (
 	const createArgv = ["herdr", "tab", "create", "--workspace", workspace, "--cwd", request.cwd];
 	if (request.label) createArgv.push("--label", request.label);
 	createArgv.push(...focusArgs);
-	const created = parseJson(
-		request,
-		"tab create",
-		await runStep(request, "tab create", createArgv, request.cwd, runCli),
-	);
-	const tabId = nestedString(created, "result", "tab", "tab_id");
-	const paneId = nestedString(created, "result", "root_pane", "pane_id");
-	if (!tabId || !paneId) throw launchError(request, "tab create", "Herdr tab create returned incomplete IDs.");
-	await runInPane(request, paneId, runCli);
-	return { multiplexer: "herdr", placement: "window", id: tabId };
+	const id = await launchInNewSurface(request, runCli, async () => {
+		const created = parseJson(
+			request,
+			"tab create",
+			await runStep(request, "tab create", createArgv, request.cwd, runCli),
+		);
+		const tabId = nestedString(created, "result", "tab", "tab_id");
+		const paneId = nestedString(created, "result", "root_pane", "pane_id");
+		if (!tabId || !paneId) throw launchError(request, "tab create", "Herdr tab create returned incomplete IDs.");
+		return { id: tabId, paneId };
+	});
+	return { multiplexer: "herdr", placement: "window", id };
 };
 
 export const herdrLaunchProvider: TerminalLaunchProvider<"herdr", typeof capabilities> = {

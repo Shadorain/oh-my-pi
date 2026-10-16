@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -638,7 +638,7 @@ describe("terminal launch dispatcher", () => {
 	// Herdr is POSIX-only and the launch script lives under the real temp dir, whose
 	// Windows path (drive letter, backslashes) is not a shell-neutral word.
 	it.skipIf(process.platform === "win32")(
-		"types only a shell-neutral script path into a new Herdr pane and preserves exact argv",
+		"types only /bin/sh and a shell-neutral script path into a new Herdr pane and preserves exact argv",
 		async () => {
 			const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "herdr-argv-"));
 			try {
@@ -682,13 +682,12 @@ describe("terminal launch dispatcher", () => {
 				});
 				const typed = calls[1]!.argv[4]!;
 				expect(calls[1]!.argv).toEqual(["herdr", "pane", "run", "w1:p2", typed]);
-				expect(typed).toMatch(/^\/[A-Za-z0-9_./-]+$/);
-				if (process.platform !== "win32") {
-					const executed = await processCli(["/bin/sh", "-c", typed], tempRoot);
-					expect(executed.exitCode).toBe(0);
-					expect(JSON.parse(executed.stdout)).toEqual(args);
-					expect(await Bun.file(typed).exists()).toBe(false);
-				}
+				expect(typed).toMatch(/^\/bin\/sh \/[A-Za-z0-9_./-]+$/);
+				const script = typed.slice("/bin/sh ".length);
+				const executed = await processCli(["/bin/sh", "-c", typed], tempRoot);
+				expect(executed.exitCode).toBe(0);
+				expect(JSON.parse(executed.stdout)).toEqual(args);
+				expect(await Bun.file(script).exists()).toBe(false);
 			} finally {
 				await fs.rm(tempRoot, { recursive: true, force: true });
 			}
@@ -730,9 +729,33 @@ describe("terminal launch dispatcher", () => {
 				"--focus",
 			]);
 			expect(calls[1]!.argv.slice(0, 4)).toEqual(["herdr", "pane", "run", "w1:p3"]);
-			await expect(fs.stat(path.dirname(calls[1]!.argv[4]!))).rejects.toThrow("ENOENT");
+			await expect(fs.stat(path.dirname(calls[1]!.argv[4]!.slice("/bin/sh ".length)))).rejects.toThrow("ENOENT");
 		},
 	);
+
+	describe("Herdr launch script setup", () => {
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
+		it.skipIf(process.platform === "win32")(
+			"creates no Herdr surface when the launch script cannot be prepared",
+			async () => {
+				const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "herdr tmp "));
+				vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+				try {
+					const { calls, launch } = createHarness({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, []);
+					await expect(
+						launch({ multiplexer: "herdr", placement: "pane", command: ["omp"], cwd: "/repo" }),
+					).rejects.toThrow("temporary directory path");
+					expect(calls).toEqual([]);
+					expect(await fs.readdir(tempRoot)).toEqual([]);
+				} finally {
+					await fs.rm(tempRoot, { recursive: true, force: true });
+				}
+			},
+		);
+	});
 
 	it("rejects Herdr launches on Windows before creating a surface", async () => {
 		const { calls, launch } = createHarness({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, [], "win32");
@@ -878,15 +901,14 @@ describe("terminal launch dispatcher", () => {
 			tmux.launch({ multiplexer: "tmux", placement: "pane", command: ["omp"], cwd: "/repo" }),
 		).rejects.toThrow("invalid ID");
 
-		const herdr = createHarness({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, [{ stdout: "not-json", exitCode: 0 }]);
-		await expect(
-			herdr.launch({
-				multiplexer: "herdr",
-				placement: "pane",
-				command: ["omp"],
-				cwd: "/repo",
-			}),
-		).rejects.toThrow("invalid JSON");
+		// Herdr writes its launch script under the real temp dir before creating a pane;
+		// a Windows temp path is never a shell-neutral word.
+		if (process.platform !== "win32") {
+			const herdr = createHarness({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, [{ stdout: "not-json", exitCode: 0 }]);
+			await expect(
+				herdr.launch({ multiplexer: "herdr", placement: "pane", command: ["omp"], cwd: "/repo" }),
+			).rejects.toThrow("invalid JSON");
+		}
 
 		const zellij = createHarness({ ZELLIJ: "1" }, [{ stdout: "terminal_not-a-number", exitCode: 0 }]);
 		await expect(

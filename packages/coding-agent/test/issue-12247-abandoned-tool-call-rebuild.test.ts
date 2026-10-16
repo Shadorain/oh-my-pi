@@ -128,4 +128,14 @@ describe("issue #12247 mid-turn transcript rebuild", () => {
 
 		expect(duringRequest[0]).toEqual([]);
 	});
+
+	it("keeps a resumed tail call live while it executes without a new assistant message", async () => {
+		const { live, duringTool } = createSession();
+
+		// Continuing from an assistant tail (as retry does after stripping a failed
+		// tool batch) executes that turn's call without emitting a new message_end.
+		await live.agent.continue();
+
+		expect(duringTool[0]).toEqual(["abandoned"]);
+	});
 });

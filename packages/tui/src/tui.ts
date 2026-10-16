@@ -2717,6 +2717,13 @@ export class TUI extends Container {
 		this.#requestOrdinaryRender();
 	}
 
+	/** Run `callback` after `delayMs` on the render scheduler's clock, unless the TUI has stopped. */
+	scheduleAfter(delayMs: number, callback: () => void): RenderTimer {
+		return this.#renderScheduler.scheduleRender(() => {
+			if (!this.#stopped) callback();
+		}, delayMs);
+	}
+
 	/**
 	 * Paint a forced frame synchronously when startup must hand off an already
 	 * visible component tree before further async initialization. Same as

@@ -15,4 +15,10 @@ describe("readLimitedText", () => {
 		});
 		expect(JSON.parse(await readLimitedText(response, "brave", 1024))).toEqual({ ok: true });
 	});
+
+	it("keeps a JSON body UTF-8 when a result string quotes a <meta charset> tag", async () => {
+		const payload = { snippet: "<meta charset=windows-1252> café" };
+		const response = new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
+		expect(JSON.parse(await readLimitedText(response, "brave", 1024))).toEqual(payload);
+	});
 });

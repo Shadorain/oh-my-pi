@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.11.2] - 2026-10-16
+
 ### Added
 
 - Added `readDamagedSqliteRows()` to salvage readable rows, including negative rowids, from damaged SQLite tables, `assertSqliteQuickCheck()` to detect damaged stores, and `onSqliteStoreQuarantine()` hooks for releasing held connections ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))

@@ -338,10 +338,9 @@ describe("SessionManager + indexed backend durability", () => {
 		expect(body).toContain("second turn");
 	});
 
-	it.each([
-		{ name: "a rejected deferred publish", prunes: false, failWrites: 1 },
-		{ name: "a synchronous size-check conflict after pruning", prunes: true, failWrites: 0 },
-	])("recovers IndexedSessionStorage after $name", async ({ prunes, failWrites }) => {
+	// The size-check conflict after pruning is covered against the real backend in
+	// sql-session-storage-manager.test.ts.
+	it("recovers IndexedSessionStorage after a rejected deferred publish", async () => {
 		const { backend, storage, manager } = await makeManager();
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("expected a session file");
@@ -350,17 +349,12 @@ describe("SessionManager + indexed backend durability", () => {
 		manager.appendMessage({ role: "user", content: "before rewrite", timestamp: Date.now() });
 		await manager.flush();
 		await storage.drain();
-		if (prunes) {
-			const turn = manager.getEntries().find(entry => entry.type === "message" && entry.message.role === "user");
-			if (turn?.type !== "message" || turn.message.role !== "user") throw new Error("expected a user turn");
-			turn.message.content = "pruned before rewrite";
-		}
 
 		const hold = Promise.withResolvers<void>();
 		backend.holdNextWrite = hold;
 		const rewritePublished = manager.rewriteEntries();
 		await backend.writeHeld.promise;
-		backend.failWrites = failWrites;
+		backend.failWrites = 1;
 		manager.appendMessage({ role: "user", content: "fenced append", timestamp: Date.now() });
 		manager.appendMessage({ role: "user", content: "after fenced append", timestamp: Date.now() });
 		hold.resolve();
