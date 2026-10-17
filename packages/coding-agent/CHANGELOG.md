@@ -6,6 +6,10 @@
 
 - With a first-party Anthropic model on the official API selected, the interactive UI opens the API connection at startup, on model switch, and when you start typing, so the next turn skips connection setup; third-party gateways and custom endpoints are never probed ([#16044](https://github.com/can1357/oh-my-pi/pull/16044) by [@H4vC](https://github.com/H4vC))
 
+### Fixed
+
+- Fixed history recall crashes and missing prompts after database damage, including interrupted recovery, malformed rows, and out-of-range prediction checkpoints ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+
 ## [18.11.3] - 2026-10-16
 
 ### Breaking Changes
@@ -63,7 +67,6 @@
 
 ### Fixed
 
-- Fixed history recall crashes and missing prompts after database damage, including interrupted recovery, malformed rows, and out-of-range prediction checkpoints ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
 - Fixed prewalk switching models during read-only MCP lookups through `write xd://` when the server marks the tool read-only ([#15994](https://github.com/can1357/oh-my-pi/issues/15994))
 - Fixed Ctrl+C printing `9;5u` in the shell after force-quitting omp with a third Ctrl+C while it was still closing the session
 - Fixed Smart unexpected-stop recovery continuing finished answers, which added extra "nothing more to add" turns

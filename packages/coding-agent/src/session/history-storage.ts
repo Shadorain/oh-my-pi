@@ -172,6 +172,13 @@ interface HistorySalvageScan {
 	history: SalvagedHistoryRow[];
 	index?: SalvagedSessionIndex;
 	carried: string[];
+	/**
+	 * False when the backup's carried applied-ledger could not be fully read,
+	 * so applying this snapshot may hide an older committed backup from the
+	 * live ledger. The drain marks such older records deferred so they replay
+	 * with a merge instead of an additive restore.
+	 */
+	ledgerComplete: boolean;
 	damagedRegions: number;
 	sourceErrors: string[];
 }
@@ -239,6 +246,13 @@ function pendingSalvagePath(dbPath: string): string {
 interface PendingSalvage {
 	backupName: string;
 	sourceIdentity?: string;
+	/**
+	 * Set when a superseding snapshot's carried ledger was unreadable, leaving
+	 * it unknown whether this backup committed before being superseded.
+	 * Deferred records replay with a maximum merge instead of an additive one,
+	 * so an already-applied snapshot cannot double-count prompts.
+	 */
+	deferred?: boolean;
 }
 
 /** GC must not delete rows that a queued snapshot can restore immediately afterwards. */
@@ -260,7 +274,8 @@ function readPendingSalvage(dbPath: string): PendingSalvage[] {
 				path.basename(record.backupName) !== record.backupName ||
 				record.backupName === "." ||
 				record.backupName === ".." ||
-				("sourceIdentity" in record && typeof record.sourceIdentity !== "string")
+				("sourceIdentity" in record && typeof record.sourceIdentity !== "string") ||
+				("deferred" in record && typeof record.deferred !== "boolean")
 			)
 				throw new Error("Invalid history salvage journal");
 			return {
@@ -269,6 +284,7 @@ function readPendingSalvage(dbPath: string): PendingSalvage[] {
 					"sourceIdentity" in record && typeof record.sourceIdentity === "string"
 						? record.sourceIdentity
 						: undefined,
+				deferred: "deferred" in record && record.deferred === true ? true : undefined,
 			};
 		});
 	} catch (error) {
@@ -283,9 +299,25 @@ function recordPendingSalvage(dbPath: string, backupPath: string): void {
 	const sourceIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
 	// A failed unlink leaves a writable original. Supersede its older snapshot
 	// rather than replaying both or losing writes committed between retries.
+	// A deferred record's successor stays deferred: supersession inherits the
+	// unknown-commit state that required the merge replay.
+	const deferred = pending.some(record => record.sourceIdentity === sourceIdentity && record.deferred);
 	const remaining = pending.filter(record => record.sourceIdentity !== sourceIdentity);
-	remaining.push({ backupName: path.basename(backupPath), sourceIdentity });
+	remaining.push({ backupName: path.basename(backupPath), sourceIdentity, deferred: deferred || undefined });
 	writeFileAtomicallySync(pendingSalvagePath(dbPath), JSON.stringify(remaining));
+}
+
+/**
+ * Marks a journaled record for merge replay. Runs before the superseding
+ * apply commits so a crash between them cannot re-queue the record for an
+ * additive replay that would double-count prompts already merged forward.
+ */
+function deferPendingSalvage(dbPath: string, backupName: string): void {
+	const pending = readPendingSalvage(dbPath);
+	const record = pending.find(entry => entry.backupName === backupName);
+	if (!record || record.deferred) return;
+	record.deferred = true;
+	writeFileAtomicallySync(pendingSalvagePath(dbPath), JSON.stringify(pending));
 }
 
 function clearPendingSalvage(dbPath: string, backupPath: string): void {
@@ -466,8 +498,19 @@ ON CONFLICT(prompt) DO UPDATE SET
 									if (rescans >= MAX_SALVAGE_RESCANS) continue;
 									throw new HistorySalvageRescan();
 								}
+								// A snapshot whose carried ledger is incomplete cannot
+								// prove whether an older committed backup already reached
+								// it. Mark those records deferred before committing the
+								// apply, so their replay merges instead of counting
+								// forward-carried prompts a second time.
+								if (!scan.ledgerComplete) {
+									for (let older = i - 1; older >= 0; older--) {
+										deferPendingSalvage(this.#dbPath, pending[older].backupName);
+										pending[older].deferred = true;
+									}
+								}
 								try {
-									this.#applySalvageScan(scan);
+									this.#applySalvageScan(scan, { mergeOnly: record.deferred === true });
 								} catch (error) {
 									// A peer holding the write lock defers the insert, same as a
 									// failed scan: the journal entry stays for the next open.
@@ -763,9 +806,14 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 * prompt that already exists like {@link collapseByPrompt}. A rebuild
 	 * inserts into an empty table; a salvage can race a peer process that
 	 * already wrote to the replacement store, and neither side's prompts may be
-	 * dropped.
+	 * dropped. `mergeOnly` replays a backup whose commit state was unknown:
+	 * its prompts may already be present via a superseding snapshot, so the
+	 * counter merges with max() rather than summing a second time.
 	 */
-	#insertRows(rows: SalvagedHistoryRow[]): void {
+	#insertRows(rows: SalvagedHistoryRow[], mergeOnly = false): void {
+		const useCountMerge = mergeOnly
+			? "max(history.use_count, excluded.use_count)"
+			: "history.use_count + excluded.use_count";
 		const insert = this.#db.query(`
 INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count)
 VALUES (
@@ -780,7 +828,7 @@ VALUES (
 		ELSE ?1 END,
 	?2, ?3, ?4, ?5, ?6)
 ON CONFLICT(prompt) DO UPDATE SET
-	use_count = history.use_count + excluded.use_count,
+	use_count = ${useCountMerge},
 	created_at = max(history.created_at, excluded.created_at),
 	cwd = CASE WHEN excluded.created_at > history.created_at THEN excluded.cwd ELSE history.cwd END,
 	session_id = CASE WHEN excluded.created_at > history.created_at THEN excluded.session_id ELSE history.session_id END
@@ -827,19 +875,21 @@ ON CONFLICT(prompt) DO UPDATE SET
 					highWater: null,
 					history: [],
 					carried: [],
+					// No snapshot was taken, so nothing could have been carried;
+					// older records replay against the live ledger as usual.
+					ledgerComplete: true,
 					damagedRegions: 0,
 					sourceErrors,
 				};
 			const backup = source;
-			const carried = readSource(() => {
-				if (!backup.query("SELECT 1 FROM sqlite_master WHERE name='history_salvage_applied'").get()) return [];
-				return readDamagedSqliteRows<{ backup_path: string }>(
-					backup,
-					"history_salvage_applied",
-					"backup_path",
-					"typeof(backup_path)='text'",
-				).rows;
-			}, []);
+			const carried = readSource(
+				() => {
+					if (!backup.query("SELECT 1 FROM sqlite_master WHERE name='history_salvage_applied'").get())
+						return { rows: [], damagedRegions: 0 };
+					return readDamagedSqliteRows<{ backup_path: string }>(backup, "history_salvage_applied", "backup_path");
+				},
+				{ rows: [] as Array<{ backup_path: string }>, damagedRegions: 1 },
+			);
 			const highWater = readSource(() => readHistorySequence(backup), null);
 			const history = readSource(
 				() => {
@@ -851,13 +901,27 @@ ON CONFLICT(prompt) DO UPDATE SET
 			const index = readSource(() => readSalvagedSessionIndex(backup), undefined);
 			source.close();
 			source = undefined;
+			// Only plain basenames are valid carried marks; anything else means
+			// the ledger row was damaged and the carried state is unknown.
+			const carriedNames = carried.rows
+				.filter(
+					(row): row is { backup_path: string } =>
+						typeof row.backup_path === "string" &&
+						row.backup_path.length > 0 &&
+						path.basename(row.backup_path) === row.backup_path,
+				)
+				.map(row => row.backup_path);
 			return {
 				backupName: path.basename(backupPath),
 				highWater,
 				history: collapseByPrompt(history.rows),
 				index,
-				carried: carried.map(row => path.basename(row.backup_path)),
-				damagedRegions: history.damagedRegions + (index?.damagedRegions ?? 0),
+				// A failed or partial ledger read leaves carried marks unknown, so
+				// older journaled backups cannot be proven committed in this
+				// snapshot; the drain defers them to a merge replay.
+				carried: carriedNames,
+				ledgerComplete: carried.damagedRegions === 0 && carriedNames.length === carried.rows.length,
+				damagedRegions: history.damagedRegions + carried.damagedRegions + (index?.damagedRegions ?? 0),
 				sourceErrors,
 			};
 		} catch (error) {
@@ -872,8 +936,11 @@ ON CONFLICT(prompt) DO UPDATE SET
 	 * Applies one scanned backup. Rows, provenance index rows, and the
 	 * applied-backup identity commit together; the durable journal entry is
 	 * cleared afterwards. The ledger makes a replay after COMMIT a no-op.
+	 * `mergeOnly` records were deferred past an incomplete carried ledger:
+	 * they may already have committed into a superseding snapshot, so their
+	 * prompt counters merge with max() instead of summing.
 	 */
-	#applySalvageScan(scan: HistorySalvageScan): void {
+	#applySalvageScan(scan: HistorySalvageScan, options?: { mergeOnly?: boolean }): void {
 		this.#db.run("PRAGMA synchronous=FULL");
 		this.#db.run("CREATE TABLE IF NOT EXISTS history_salvage_applied (backup_path TEXT PRIMARY KEY)");
 		const applied = this.#db.query("SELECT 1 FROM history_salvage_applied WHERE backup_path = ?");
@@ -884,7 +951,7 @@ ON CONFLICT(prompt) DO UPDATE SET
 		this.#db
 			.transaction(() => {
 				if (applied.get(scan.backupName)) return;
-				this.#insertRows(scan.history);
+				this.#insertRows(scan.history, options?.mergeOnly === true);
 				if (scan.index) restoreSalvagedSessionIndex(scan.index, this.#db);
 				// Sequence last: a collision remap above picks a free id below the
 				// water mark, which an earlier restore would skip past and send

@@ -2,15 +2,6 @@
 
 ## [Unreleased]
 
-## [18.11.3] - 2026-10-16
-
-### Fixed
-
-- Fixed Markdown fence info-string parsing to keep backtick-containing backtick openers as paragraph text while accepting backticks in tilde info strings and Unicode line separators in either fence's info string ([#15928](https://github.com/can1357/oh-my-pi/pull/15928) by [@jchanghong023](https://github.com/jchanghong023)).
-- Fixed `parseHTML` treating `<link>` in RSS/Atom documents as an HTML void element, which dropped the URL text of RSS `<link>…</link>` ([#15954](https://github.com/can1357/oh-my-pi/issues/15954))
-
-## [18.11.2] - 2026-10-16
-
 ### Added
 
 - Added `readDamagedSqliteRows()` to salvage readable rows, including negative rowids, from damaged SQLite tables, `assertSqliteQuickCheck()` to detect damaged stores, and `onSqliteStoreQuarantine()` hooks for releasing held connections ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
@@ -23,6 +14,18 @@
 ### Fixed
 
 - Fixed SQLite salvage skipping the minimum signed rowid ([#15751](https://github.com/can1357/oh-my-pi/pull/15751) by [@Shadorain](https://github.com/Shadorain))
+
+## [18.11.3] - 2026-10-16
+
+### Fixed
+
+- Fixed Markdown fence info-string parsing to keep backtick-containing backtick openers as paragraph text while accepting backticks in tilde info strings and Unicode line separators in either fence's info string ([#15928](https://github.com/can1357/oh-my-pi/pull/15928) by [@jchanghong023](https://github.com/jchanghong023)).
+- Fixed `parseHTML` treating `<link>` in RSS/Atom documents as an HTML void element, which dropped the URL text of RSS `<link>…</link>` ([#15954](https://github.com/can1357/oh-my-pi/issues/15954))
+
+## [18.11.2] - 2026-10-16
+
+### Added
+
 - Exported `sqliteFileIdentity()`, so a caller holding a long-lived SQLite connection can tell when its path now names a different file (e.g. after a corrupt store was quarantined and replaced) ([#14361](https://github.com/can1357/oh-my-pi/pull/14361) by [@F0Rextasy](https://github.com/F0Rextasy))
 - Added `slugify()`, the shared lowercase ASCII kebab-case helper with an optional `maxLength` ([#14283](https://github.com/can1357/oh-my-pi/pull/14283) by [@jaredlyon](https://github.com/jaredlyon))
 

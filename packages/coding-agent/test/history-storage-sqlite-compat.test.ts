@@ -1211,3 +1211,113 @@ it("does not hold the recovery lease while scanning a queued backup", async () =
 	HistoryStorage.open(dbPath);
 	expect(leaseHeldDuringScan).toBe(false);
 });
+
+/**
+ * Seeds a backup whose carried applied-ledger holds one malformed (blob) row.
+ * The scan cannot prove which older backups committed into this snapshot, so
+ * the drain must defer older journal records to a merge replay.
+ */
+function seedBackupWithDamagedLedger(
+	backupPath: string,
+	rows: Array<[id: number, prompt: string, useCount: number]>,
+): void {
+	const backup = new Database(backupPath);
+	backup.exec(`
+		CREATE TABLE history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			prompt TEXT NOT NULL UNIQUE,
+			created_at INTEGER NOT NULL,
+			cwd TEXT,
+			session_id TEXT,
+			use_count INTEGER NOT NULL DEFAULT 1
+		);
+		CREATE TABLE session_titles (
+			session_id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		CREATE TABLE session_recaps (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			cwd TEXT NOT NULL,
+			recap TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX idx_session_recaps_session ON session_recaps(session_id, created_at);
+		CREATE TABLE history_salvage_applied (backup_path TEXT PRIMARY KEY);
+	`);
+	for (const [id, prompt, useCount] of rows) {
+		backup
+			.query(
+				"INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count) VALUES (?, ?, ?, '/project', 'session-a', ?)",
+			)
+			.run(id, prompt, LEGACY_TIMESTAMP, useCount);
+	}
+	if (rows.length) {
+		backup
+			.query(
+				"INSERT INTO session_recaps (id, session_id, cwd, recap, created_at) VALUES (5, 'session-a', '/project', 'recap one', ?)",
+			)
+			.run(LEGACY_TIMESTAMP);
+	}
+	// A damaged ledger row: a blob where only backup basenames are valid.
+	backup.query("INSERT INTO history_salvage_applied (backup_path) VALUES (?)").run(new Uint8Array([1, 2]) as never);
+	backup.close();
+}
+
+function queueBackups(dbPath: string, ...backupPaths: string[]): void {
+	fs.writeFileSync(
+		`${dbPath}.pending-salvage`,
+		JSON.stringify(backupPaths.map(backupPath => ({ backupName: path.basename(backupPath) }))),
+	);
+}
+
+it("replays an older backup without double counting when a newer snapshot's carried ledger is unreadable", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-carried-ledger-");
+	const dbPath = tempDir.join("history.db");
+	// The older backup committed into the newer snapshot, but crashed before its
+	// journal entry was cleared. The newer snapshot's ledger page is damaged, so
+	// the drain cannot prove the commit — replaying additively would count its
+	// prompts twice.
+	const olderPath = tempDir.join("history.db.corrupt-older");
+	const newerPath = tempDir.join("history.db.corrupt-newer");
+	seedBackupWithDamagedLedger(olderPath, [[1, "stranded prompt", 3]]);
+	// The newer snapshot carries the older backup's merged rows, but its ledger
+	// lost the readable mark: replaying the older record additively would count
+	// its prompt a second time.
+	fs.copyFileSync(olderPath, newerPath);
+	queueBackups(dbPath, olderPath, newerPath);
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(storage.getRecent(10)).toMatchObject([{ prompt: "stranded prompt", useCount: 3 }]);
+	const verify = new Database(dbPath, { readonly: true });
+	try {
+		expect(verify.query("SELECT COUNT(*) AS n FROM session_recaps WHERE recap = 'recap one'").get()).toEqual({
+			n: 1,
+		});
+	} finally {
+		verify.close();
+	}
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});
+
+it("still restores an older backup that never committed past an unreadable carried ledger", async () => {
+	tempDir = TempDir.createSync("@omp-history-storage-carried-rollback-");
+	const dbPath = tempDir.join("history.db");
+	const olderPath = tempDir.join("history.db.corrupt-older");
+	const newerPath = tempDir.join("history.db.corrupt-newer");
+	seedBackupWithDamagedLedger(olderPath, [[1, "stranded prompt", 3]]);
+	// The older backup's apply rolled back, so the newer snapshot lacks its rows.
+	seedBackupWithDamagedLedger(newerPath, [[7, "newer prompt", 1]]);
+	queueBackups(dbPath, olderPath, newerPath);
+
+	const storage = HistoryStorage.open(dbPath);
+	expect(
+		storage
+			.getRecent(10)
+			.map(entry => entry.prompt)
+			.sort(),
+	).toEqual(["newer prompt", "stranded prompt"]);
+	expect(storage.search("stranded", 10)).toMatchObject([{ prompt: "stranded prompt", useCount: 3 }]);
+	expect(fs.existsSync(`${dbPath}.pending-salvage`)).toBe(false);
+});

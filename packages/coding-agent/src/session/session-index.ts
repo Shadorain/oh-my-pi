@@ -289,7 +289,7 @@ export function readSalvagedSessionIndex(source: Database): SalvagedSessionIndex
 	return { titles: titles.rows, recaps: recaps.rows, damagedRegions: titles.damagedRegions + recaps.damagedRegions };
 }
 
-/** Restore a source snapshot inside the caller's salvage transaction. */
+/** Restore a source snapshot inside the caller's salvage transaction. Identical recaps are skipped so replaying an already-carried backup cannot duplicate them under a remapped id. */
 export function restoreSalvagedSessionIndex(snapshot: SalvagedSessionIndex, target: Database): void {
 	target.run(SESSION_INDEX_DDL);
 	const insertTitle = target.query(`
@@ -299,7 +299,11 @@ WHERE excluded.updated_at > session_titles.updated_at
 	`);
 	const insertRecap = target.query(`
 INSERT INTO session_recaps (id, session_id, cwd, recap, created_at)
-VALUES (CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = CAST(?1 AS INTEGER)) THEN NULL ELSE CAST(?1 AS INTEGER) END, ?2, ?3, ?4, ?5)
+SELECT CASE WHEN EXISTS (SELECT 1 FROM session_recaps WHERE id = CAST(?1 AS INTEGER)) THEN NULL ELSE CAST(?1 AS INTEGER) END, ?2, ?3, ?4, ?5
+WHERE NOT EXISTS (
+	SELECT 1 FROM session_recaps
+	WHERE session_id = ?2 AND cwd = ?3 AND recap = ?4 AND created_at = ?5
+)
 	`);
 	for (const row of snapshot.titles) insertTitle.run(row.session_id, row.title, row.updated_at);
 	for (const row of snapshot.recaps) insertRecap.run(row.id, row.session_id, row.cwd, row.recap, row.created_at);
