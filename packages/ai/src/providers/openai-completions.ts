@@ -936,6 +936,7 @@ const streamOpenAICompletionsOnce = (
 						headers: headersWithTimeout,
 						body: params,
 						signal: requestSignal,
+						maxAttempts: options?.maxHttpAttempts,
 						fetch: wrapFetchForCopilotFallback(
 							options?.fetch,
 							model.provider === "github-copilot",
@@ -1866,7 +1867,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (mo
 	const resolvedModel = resolveOpenAICompletionsCompat(model);
 	return withReplaySafeStreamRetry(resolvedModel, context, options, streamOpenAICompletionsOnce, {
 		retryEmptyCompletion: true,
-		retryProviderErrors: true,
+		retryProviderErrors: options?.maxHttpAttempts === undefined,
 		maxProviderErrorRetries: 1,
 	});
 };
