@@ -23,13 +23,7 @@ import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { resolveToCwd } from "../tools/path-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
-import {
-	isSessionUpdateManagedByTern,
-	parseSessionUpdateArgs,
-	runSessionUpdate,
-	TERN_UPDATE_DISABLED,
-	YES_NO_PROMPT,
-} from "./helpers/self-update";
+import { parseSessionUpdateArgs, runSessionUpdate, YES_NO_PROMPT } from "./helpers/self-update";
 import { handleSshAcp } from "./helpers/ssh";
 import type {
 	ParsedSlashCommand,
@@ -853,25 +847,18 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		handleTui: async (command, runtime) => {
 			clearSubmittedText(runtime);
 			const { ctx } = runtime;
-			if (isSessionUpdateManagedByTern()) {
-				ctx.showStatus(TERN_UPDATE_DISABLED);
-				return;
-			}
-			if (ctx.session.isStreaming) {
-				ctx.showStatus("Wait for the current response to finish before updating.");
-				return;
-			}
 			const parsed = parseSessionUpdateArgs(command.args);
 			if ("error" in parsed) {
 				ctx.showStatus(parsed.error);
 				return;
 			}
-			ctx.showStatus("Checking for omp updates…");
-			ctx.ui.requestRender();
 			await runSessionUpdate({
 				flags: parsed.flags,
 				ui: {
-					status: message => ctx.showStatus(message),
+					status: message => {
+						ctx.showStatus(message);
+						ctx.ui.requestRender();
+					},
 					confirm: (title, message) => ctx.showHookConfirm(title, message, YES_NO_PROMPT),
 					busy: () => ctx.session.isStreaming,
 					restart: entry => ctx.restart({ entry }),

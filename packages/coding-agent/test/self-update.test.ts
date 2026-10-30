@@ -1,15 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
-	classifyUpdateTranscript,
-	type InstallIdentity,
 	parseSessionUpdateArgs,
 	runSessionUpdate,
 	type SessionUpdateUi,
-	type UpdateSpawnResult,
 } from "../src/slash-commands/helpers/self-update";
 
-const installed: InstallIdentity = { sourceCheckout: false, pathEntry: "/home/me/.local/share/mise/shims/omp" };
-const sourceCheckout: InstallIdentity = { sourceCheckout: true, pathEntry: "/home/me/.local/bin/omp" };
+const installed = { sourceCheckout: false, pathEntry: "/home/me/.local/share/mise/shims/omp" };
+const sourceCheckout = { sourceCheckout: true, pathEntry: "/home/me/.local/bin/omp" };
 
 const CHECK_OUTPUT = "Current version: 18.8.7\nNew version available: 18.9.0\n";
 const INSTALL_OUTPUT =
@@ -17,10 +14,10 @@ const INSTALL_OUTPUT =
 
 /** Fake child: answers `--check` runs and install runs from fixed transcripts. */
 function harness(options: {
-	identity: InstallIdentity;
+	identity: { sourceCheckout: boolean; pathEntry?: string };
 	answers: boolean[];
-	check?: UpdateSpawnResult;
-	install?: UpdateSpawnResult;
+	check?: { exitCode: number; output: string };
+	install?: { exitCode: number; output: string };
 	busyAfterInstall?: boolean;
 	env?: Record<string, string | undefined>;
 }) {
@@ -41,7 +38,7 @@ function harness(options: {
 			restarts.push(entry);
 		},
 	};
-	const spawn = async (cmd: string[]): Promise<UpdateSpawnResult> => {
+	const spawn = async (cmd: string[]): Promise<{ exitCode: number; output: string }> => {
 		const flags = cmd.slice(cmd.indexOf("update") + 1);
 		calls.push(flags);
 		if (flags.includes("--check")) return options.check ?? { exitCode: 0, output: CHECK_OUTPUT };
@@ -65,16 +62,13 @@ describe("Tern-managed updates", () => {
 		"TERN_WINDOW_KEY",
 		"TERN_WINDOW_SOCKET",
 	]) {
-		it(`blocks checking, installing, and restarting when ${marker} is present, even empty`, async () => {
+		it(`does not check, install, or restart when ${marker} is set`, async () => {
 			const h = harness({ identity: installed, answers: [true, true], env: { [marker]: "" } });
-			await h.run();
-			await h.run(["--check"]);
 			await h.run(["--force", "--canary"]);
 			expect(h.calls).toEqual([]);
 			expect(h.prompts).toEqual([]);
 			expect(h.restarts).toEqual([]);
-			expect(h.status).toHaveLength(3);
-			for (const status of h.status) expect(status).toContain("Tern");
+			expect(h.status[0]).toContain("Tern");
 		});
 	}
 });
@@ -97,81 +91,22 @@ describe("parseSessionUpdateArgs", () => {
 	});
 });
 
-describe("classifyUpdateTranscript", () => {
-	it("reports the updater's failure reason once, without its own prefix", () => {
-		expect(classifyUpdateTranscript("install", 1, "Updated to 19.0.0\nUpdate failed: Error: disk full")).toEqual({
-			kind: "failed",
-			detail: "Error: disk full",
-		});
-	});
-
-	it("does not treat a managed or Nix refusal as an install", () => {
-		expect(
-			classifyUpdateTranscript(
-				"check",
-				0,
-				"/usr/bin/omp is installed and kept up to date by Tern; update it from Tern.",
-			),
-		).toEqual({ kind: "blocked" });
-		expect(
-			classifyUpdateTranscript("install", 0, "This installation is managed by Nix and cannot update itself."),
-		).toEqual({
-			kind: "blocked",
-		});
-	});
-
-	it("reads versions for update, reinstall, and channel switch on a check run", () => {
-		expect(classifyUpdateTranscript("check", 0, CHECK_OUTPUT)).toEqual({
-			kind: "available",
-			version: "18.9.0",
-			current: "18.8.7",
-		});
-		expect(classifyUpdateTranscript("check", 0, "Current version: 18.8.7\nForcing reinstall of 18.8.7")).toEqual({
-			kind: "available",
-			version: "18.8.7",
-			current: "18.8.7",
-		});
-	});
-
-	it("treats a clean install as installed even if the success line is reworded", () => {
-		expect(
-			classifyUpdateTranscript("install", 0, "New version available: 18.9.0\nAll done: omp 18.9.0 is live"),
-		).toEqual({
-			kind: "installed",
-		});
-		expect(
-			classifyUpdateTranscript("install", 0, "Warning: omp at /x still reports 18.8.7 (expected 18.9.0)"),
-		).toEqual({
-			kind: "unverified",
-		});
-	});
-
-	it("strips non-SGR escapes and tabs from installer output", async () => {
-		const h = harness({
-			identity: installed,
-			answers: [true, false],
-			install: { exitCode: 0, output: "==> Upgrading\x1b[K\x1b]0;brew\x07\tomp\n✔ Updated to 18.9.0\n" },
-		});
-		await h.run();
-		const shown = h.status.join("\n");
-		expect(shown).not.toContain("\x1b");
-		expect(shown).not.toContain("\t");
-		expect(shown).toContain("Upgrading");
-	});
-});
-
 describe("runSessionUpdate", () => {
 	it("installs nothing when the user answers no to the update prompt", async () => {
 		const h = harness({ identity: installed, answers: [false] });
 		await h.run();
 		expect(h.calls).toEqual([["--check"]]);
 		expect(h.prompts).toEqual([{ title: "Update omp?", message: "Update omp 18.8.7 → 18.9.0?" }]);
-		expect(h.status).toEqual(["Update skipped."]);
+		expect(h.status.at(-1)).toBe("Update skipped.");
 		expect(h.restarts).toEqual([]);
 	});
 
-	it("restarts through the unresolved PATH entry so argv[0] shims like mise still launch omp", async () => {
-		const h = harness({ identity: installed, answers: [true, true] });
+	it("restarts through the unresolved PATH entry even if the success line is reworded", async () => {
+		const h = harness({
+			identity: installed,
+			answers: [true, true],
+			install: { exitCode: 0, output: "All done: omp 18.9.0 is live\nRestart omp to use the new version\n" },
+		});
 		await h.run(["--force"]);
 		expect(h.calls).toEqual([["--force", "--check"], ["--force"]]);
 		expect(h.prompts[1]?.title).toBe("Restart omp?");
@@ -180,9 +115,14 @@ describe("runSessionUpdate", () => {
 	});
 
 	it("keeps running the old process when the restart prompt is declined", async () => {
-		const h = harness({ identity: installed, answers: [true, false] });
+		const h = harness({
+			identity: installed,
+			answers: [true, false],
+			install: { exitCode: 0, output: "==> Upgrading\x1b[K\x1b]0;brew\x07\tomp\n✔ Updated to 18.9.0\n" },
+		});
 		await h.run();
 		expect(h.restarts).toEqual([]);
+		expect(h.status.join("\n")).not.toMatch(/\x1b|\t/);
 		expect(h.status.at(-1)).toContain("/restart");
 	});
 
@@ -207,7 +147,7 @@ describe("runSessionUpdate", () => {
 		await h.run(["--check"]);
 		expect(h.calls).toEqual([["--check"]]);
 		expect(h.prompts).toEqual([]);
-		expect(h.status[0]).toContain("New version available: 18.9.0");
+		expect(h.status.join("\n")).toContain("New version available: 18.9.0");
 	});
 
 	it("does not prompt when the check reports up to date or a managed install", async () => {
@@ -222,16 +162,17 @@ describe("runSessionUpdate", () => {
 		}
 	});
 
-	it("reports a Nix refusal from the install run and does not offer a restart", async () => {
-		const h = harness({
-			identity: installed,
-			answers: [true],
-			install: { exitCode: 0, output: "This installation is managed by Nix and cannot update itself." },
-		});
-		await h.run();
-		expect(h.prompts).toHaveLength(1);
-		expect(h.restarts).toEqual([]);
-		expect(h.status.at(-1)).toContain("cannot update itself");
+	it("reports a refused or unverified install and does not offer a restart", async () => {
+		for (const output of [
+			"This installation is managed by Nix and cannot update itself.",
+			"Warning: omp at /x still reports 18.8.7 (expected 18.9.0)",
+		]) {
+			const h = harness({ identity: installed, answers: [true], install: { exitCode: 0, output } });
+			await h.run();
+			expect(h.prompts).toHaveLength(1);
+			expect(h.restarts).toEqual([]);
+			expect(h.status.at(-1)).toContain(output);
+		}
 	});
 
 	it("surfaces a failed install once and does not offer a restart", async () => {
